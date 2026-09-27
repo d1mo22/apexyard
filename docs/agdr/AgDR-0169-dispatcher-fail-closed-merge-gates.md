@@ -80,8 +80,54 @@ right single point for this rule.
   every hook that has not yet done that internal work, and for any new
   failure mode the internal work does not anticipate.
 
+## Addendum — the dispatcher fix alone did not close the default-bash case (me2resh/apexyard#1405 second review, Hakim H2)
+
+The Decision above says the dispatcher fix closes "every other way a
+merge gate can die before reaching its own BLOCK/PASS decision." That
+claim is too broad. Hakim's second-round review found one way a merge
+gate dies that the dispatcher wrapper structurally cannot see: a missing
+`_lib-extract-pr.sh` in the DEFAULT (non-POSIX) shell.
+
+In default bash, sourcing a missing file with a bare `.` returns 1 — it
+does not end the script. Each merge gate's own next line is `if !
+is_merge_command "$COMMAND"; then exit 0; fi`. With the library missing,
+`is_merge_command` is undefined; calling it prints "command not found"
+and returns 127; the negated check reads that as "not a merge command";
+the gate calls `exit 0` **on purpose**, by its own normal logic. That is
+not a crash — it is the gate's ordinary "nothing to do here" exit path,
+reached for the wrong reason. `run_merge_gate_hook` only reclassifies a
+non-zero, non-2 exit as BLOCKED; an exit 0 is indistinguishable from a
+gate that correctly decided the command was not a merge. The dispatcher
+cannot fail closed on a signal that looks identical to a legitimate
+pass.
+
+**Fix:** each of the four merge gates now guards its own `.` of
+`_lib-extract-pr.sh` and `_lib-review-markers.sh` with an explicit
+readability check before sourcing, printing a BLOCKED message and
+exiting 2 immediately when either library is missing or fails to load.
+This closes the gap AT THE POINT the missing library would otherwise
+manufacture a false "not a merge command" signal — before
+`is_merge_command` is ever called undefined. See
+`.claude/hooks/block-unreviewed-merge.sh`,
+`.claude/hooks/require-design-review-for-ui.sh`,
+`.claude/hooks/block-merge-on-red-ci.sh`, and
+`.claude/hooks/require-architecture-review.sh` for the `_require_lib`
+guard, and each hook's test file for a case that removes each library in
+turn and expects a block, in both default bash and `bash --posix`.
+
+**The dispatcher fix and the per-hook guard are complementary, not
+redundant.** The dispatcher wrapper still catches every failure mode
+that DOES produce a visible non-zero, non-2 exit (a syntax error, a
+missing gate file, a killed process, the POSIX-mode fatal source this
+AgDR was originally written for). The per-hook guard catches the one
+failure mode that doesn't — a missing REQUIRED library in a shell where
+sourcing a missing file is merely non-fatal. Narrower framing: the
+dispatcher closes every way a merge gate can die LOUDLY; the per-hook
+guard closes the one way it can die QUIETLY.
+
 ## Artifacts
 
 - Issue: me2resh/apexyard#1403
 - Parent: docs/agdr/AgDR-0157-bash-pretooluse-dispatcher.md
 - Related: docs/agdr/AgDR-0162-dispatch-merge-gates-inside-wrappers.md
+- Round 2 review: me2resh/apexyard#1405 (Hakim H2)

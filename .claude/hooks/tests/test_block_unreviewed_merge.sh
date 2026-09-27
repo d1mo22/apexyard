@@ -931,6 +931,41 @@ else
   FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}1091-control-healthy "
 fi
 
+# me2resh/apexyard#1405 second-round review, Hakim H2: a missing required
+# library (_lib-extract-pr.sh or _lib-review-markers.sh) must BLOCK the
+# merge in DEFAULT bash, not just under POSIXLY_CORRECT. Before the
+# per-hook `_require_lib` guard, a missing library made `is_merge_command`
+# undefined; the negated `if ! is_merge_command "$COMMAND"; then exit 0;
+# fi` check then read the resulting "command not found" (127) as "not a
+# merge command" and exited 0 — a clean, deliberate-looking allow that the
+# dispatcher's fail-closed wrapper (AgDR-0169) cannot see, because nothing
+# about that exit code says a gate failed to load.
+for lib in _lib-extract-pr.sh _lib-review-markers.sh; do
+  for mode in default posix; do
+    sb=$(make_sandbox)
+    write_rex_marker "$sb" 300
+    write_ceo_marker_structured "$sb" 300
+    rm -f "$sb/.claude/hooks/$lib"
+    input=$(jq -nc --arg c "gh pr merge 300 --repo me2resh/apexyard --squash" '{tool_name:"Bash", tool_input:{command:$c}}')
+    if [ "$mode" = "posix" ]; then
+      got_stderr=$(cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash -c \
+        "echo '$input' | POSIXLY_CORRECT=1 bash .claude/hooks/block-unreviewed-merge.sh" 2>&1 >/dev/null)
+    else
+      got_stderr=$(cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash -c \
+        "echo '$input' | bash .claude/hooks/block-unreviewed-merge.sh" 2>&1 >/dev/null)
+    fi
+    got_rc=$?
+    rm -rf "$sb"
+    label="missing-$lib-blocks-in-$mode-bash"
+    if [ "$got_rc" = "2" ] && echo "$got_stderr" | grep -qi "BLOCKED"; then
+      echo "PASS [$label]"; PASS=$((PASS+1))
+    else
+      echo "FAIL [$label]: want rc=2 + BLOCKED, got rc=$got_rc stderr=${got_stderr:0:300}" >&2
+      FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    fi
+  done
+done
+
 # --- Summary ----------------------------------------------------------
 
 echo ""
