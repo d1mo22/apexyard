@@ -40,7 +40,7 @@
 # relative `cd .` chain). Dropping `cd`-text parsing entirely removes that
 # whole class of finding. A compound command that `cd`s before pushing
 # falls back to the working directory and prints a one-line advisory —
-# see docs/agdr/AgDR-0170-pre-push-trust-boundary.md for the accepted
+# see docs/agdr/AgDR-0171-pre-push-trust-boundary.md for the accepted
 # limit this narrowing records.
 
 # HOOK_DIR: this file's own directory, used below to source the shared
@@ -264,7 +264,7 @@ fi
 # A leading `cd` was present but is never resolved — say so, since the
 # gate is about to check the working directory instead of wherever that
 # `cd` pointed. Non-blocking; the accepted limit is recorded in
-# docs/agdr/AgDR-0170-pre-push-trust-boundary.md.
+# docs/agdr/AgDR-0171-pre-push-trust-boundary.md.
 if [ "$HAD_CD_PREFIX" -eq 1 ] && [ "$TARGET_EXPLICIT" -eq 0 ]; then
   cat >&2 <<MSG
 NOTE: pre-push-gate checked the working directory (${PWD}), not a
@@ -316,7 +316,7 @@ CMDS_JSON=""
 # `.pre_push.commands` was always free to declare arbitrary shell commands,
 # run via `bash -c` below; only the INTERPRETER's location changes here,
 # not what a repo may configure. See
-# docs/agdr/AgDR-0170-pre-push-trust-boundary.md.
+# docs/agdr/AgDR-0171-pre-push-trust-boundary.md.
 if [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
   . "$HOOK_DIR/_lib-read-config.sh"
