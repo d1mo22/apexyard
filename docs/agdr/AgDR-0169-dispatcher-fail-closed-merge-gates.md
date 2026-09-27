@@ -82,48 +82,41 @@ right single point for this rule.
 
 ## Addendum — the dispatcher fix alone did not close the default-bash case (me2resh/apexyard#1405 second review, Hakim H2)
 
-The Decision above says the dispatcher fix closes "every other way a
-merge gate can die before reaching its own BLOCK/PASS decision." That
-claim is too broad. Hakim's second-round review found one way a merge
-gate dies that the dispatcher wrapper structurally cannot see: a missing
-`_lib-extract-pr.sh` in the DEFAULT (non-POSIX) shell.
+The Decision above claims the dispatcher fix closes "every other way a
+merge gate can die." That claim is too broad. Hakim's second review
+found one failure mode the dispatcher structurally cannot see: a missing
+`_lib-extract-pr.sh` in DEFAULT (non-POSIX) bash.
 
-In default bash, sourcing a missing file with a bare `.` returns 1 — it
-does not end the script. Each merge gate's own next line is `if !
-is_merge_command "$COMMAND"; then exit 0; fi`. With the library missing,
-`is_merge_command` is undefined; calling it prints "command not found"
-and returns 127; the negated check reads that as "not a merge command";
-the gate calls `exit 0` **on purpose**, by its own normal logic. That is
-not a crash — it is the gate's ordinary "nothing to do here" exit path,
-reached for the wrong reason. `run_merge_gate_hook` only reclassifies a
-non-zero, non-2 exit as BLOCKED; an exit 0 is indistinguishable from a
-gate that correctly decided the command was not a merge. The dispatcher
-cannot fail closed on a signal that looks identical to a legitimate
-pass.
+In default bash, a missing-file source returns 1. It does not end the
+script. Each gate's next line is `if ! is_merge_command "$COMMAND"; then
+exit 0; fi`. The missing library leaves `is_merge_command` undefined.
+Calling it prints "command not found" and returns 127. The negated
+check reads that as "not a merge command." The gate then calls `exit 0`
+on purpose, by its own normal logic. This is not a crash. It is the
+gate's ordinary "nothing to do here" path, reached for the wrong reason.
+`run_merge_gate_hook` reclassifies a non-zero, non-2 exit as BLOCKED.
+An exit 0 gives it nothing to reclassify — the signal is identical to a
+legitimate pass.
 
-**Fix:** each of the four merge gates now guards its own `.` of
-`_lib-extract-pr.sh` and `_lib-review-markers.sh` with an explicit
-readability check before sourcing, printing a BLOCKED message and
-exiting 2 immediately when either library is missing or fails to load.
-This closes the gap AT THE POINT the missing library would otherwise
-manufacture a false "not a merge command" signal — before
-`is_merge_command` is ever called undefined. See
-`.claude/hooks/block-unreviewed-merge.sh`,
+**Fix:** each of the four merge gates now guards its own source of
+`_lib-extract-pr.sh` and `_lib-review-markers.sh`. Each guard checks
+readability first. It prints a BLOCKED message and exits 2 when either
+library is missing or fails to load. This runs before `is_merge_command`
+can ever be called undefined. See `.claude/hooks/block-unreviewed-merge.sh`,
 `.claude/hooks/require-design-review-for-ui.sh`,
 `.claude/hooks/block-merge-on-red-ci.sh`, and
 `.claude/hooks/require-architecture-review.sh` for the `_require_lib`
-guard, and each hook's test file for a case that removes each library in
-turn and expects a block, in both default bash and `bash --posix`.
+guard. Each hook's test file removes each library in turn and expects a
+block, in default bash and under `bash --posix`.
 
-**The dispatcher fix and the per-hook guard are complementary, not
-redundant.** The dispatcher wrapper still catches every failure mode
-that DOES produce a visible non-zero, non-2 exit (a syntax error, a
-missing gate file, a killed process, the POSIX-mode fatal source this
-AgDR was originally written for). The per-hook guard catches the one
-failure mode that doesn't — a missing REQUIRED library in a shell where
-sourcing a missing file is merely non-fatal. Narrower framing: the
-dispatcher closes every way a merge gate can die LOUDLY; the per-hook
-guard closes the one way it can die QUIETLY.
+**The two fixes are complementary, not redundant.** The dispatcher
+wrapper still catches every failure mode with a visible non-zero, non-2
+exit — a syntax error, a missing gate file, a killed process, or the
+POSIX-mode fatal source this AgDR first covered. The per-hook guard
+catches the one mode that produces no such signal: a missing required
+library in a shell where a missing-file source is not fatal. Read
+narrowly: the dispatcher closes every way a merge gate can die loudly.
+The per-hook guard closes the one way it can die quietly.
 
 ## Artifacts
 
