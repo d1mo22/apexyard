@@ -151,17 +151,91 @@ run_push_hooks() {
   run_hook block-agent-routing-drift.sh
 }
 
-# is_push_command: recognises `git push` and `git -C <dir> push` anywhere in
-# the command text, not only as a literal prefix (me2resh/apexyard#1366,
-# #1405 review items 1 / H1 item 3). Mirrors pre-push-gate.sh's own
-# push-clause regex, which the hook needs anyway to resolve the pushed
-# repo — two independent copies of the same pattern, the same shape as the
-# other `\bgit\s+push\b` checks already duplicated across this framework's
-# hooks (block-main-push.sh, validate-branch-name.sh, and others each carry
-# their own).
-is_push_command() {
+# is_push_command: recognises a real `git push` AT COMMAND POSITION only —
+# the start of the command, or immediately after a top-level `&&`, `||`,
+# `;`, or `|` (optional leading env-var assignments and `git -C` /
+# `--git-dir` flags allowed in between). Does NOT match a `git push`
+# substring inside a quoted argument, a grep/echo pattern, a commit
+# message, or a shell comment (me2resh/apexyard#1405 second-round review,
+# Rex B2 / Hakim H1 item 1). The previous version matched `\bgit...push\b`
+# ANYWHERE in the command text, which routed a read-only search or a
+# commit message that merely MENTIONS a push into the push hooks —
+# including pre-push-gate.sh's own repo-declared `.pre_push.commands`
+# runner.
+#
+# Splitting on `&&`/`||`/`;`/`|` is a naive text substitution — NOT quote-
+# aware, the same accepted limit as this framework's other command
+# splitters (see `_lib-detect-bash-write.sh`'s `_bdw_split_top_level`, not
+# sourced here — that file has two contributor PRs open against it and
+# this dispatcher needs an independent copy anyway, the same duplication
+# shape pre-push-gate.sh's own copy of this logic already carries). A
+# physical newline in COMMAND is already a segment boundary for free — the
+# `while read` loop below reads line by line.
+_dp_split_segments() {
   local cmd="$1"
-  echo "$cmd" | grep -qE '\bgit[[:space:]]+(-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:];&|]+)[[:space:]]+)?push\b'
+  local split="$cmd"
+  split="${split//&&/$'\n'}"
+  split="${split//||/$'\n'}"
+  split="${split//;/$'\n'}"
+  split="${split//|/$'\n'}"
+  printf '%s\n' "$split"
+}
+
+_dp_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  while [ "${s:0:1}" = "(" ]; do
+    s="${s:1}"
+    s="${s#"${s%%[![:space:]]*}"}"
+  done
+  printf '%s' "$s"
+}
+
+_dp_strip_env_assignments() {
+  local s="$1"
+  while printf '%s' "$s" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]'; do
+    s=$(printf '%s' "$s" | sed -E 's/^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+//')
+  done
+  printf '%s' "$s"
+}
+
+_dp_consume_flags() {
+  local rest="$1"
+  while :; do
+    if printf '%s' "$rest" | grep -qE '^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      rest=$(printf '%s' "$rest" | sed -E 's/^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    if printf '%s' "$rest" | grep -qE '^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      rest=$(printf '%s' "$rest" | sed -E 's/^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    break
+  done
+  printf '%s' "$rest"
+}
+
+is_push_command() {
+  local cmd="$1" seg t stripped rest segs
+  # A here-string (`<<<`), not process substitution (`< <(...)`) — process
+  # substitution is a syntax ERROR under POSIXLY_CORRECT/`bash --posix`
+  # (verified empirically; AgDR-0169's own POSIX-mode test coverage means
+  # this dispatcher must parse cleanly in that mode too). A here-string
+  # keeps the loop in the CURRENT shell either way, same as process
+  # substitution would, so nothing about the matching behavior changes.
+  segs="$(_dp_split_segments "$cmd")"
+  while IFS= read -r seg; do
+    t="$(_dp_trim "$seg")"
+    [ -z "$t" ] && continue
+    stripped="$(_dp_strip_env_assignments "$t")"
+    printf '%s' "$stripped" | grep -qE '^git([[:space:]]|$)' || continue
+    rest="$(printf '%s' "$stripped" | sed -E 's/^git[[:space:]]*//')"
+    rest="$(_dp_consume_flags "$rest")"
+    if printf '%s' "$rest" | grep -qE '^push([[:space:]]|$)'; then
+      return 0
+    fi
+  done <<< "$segs"
+  return 1
 }
 
 _merge_gates_ran=0

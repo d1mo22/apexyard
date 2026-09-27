@@ -75,6 +75,33 @@ done
 run 'git push origin HEAD'
 [ "$(grep -c '^pre-push-gate.sh$' "$TMP/log")" -eq 1 ]
 
+# me2resh/apexyard#1405 second-round review (Rex B2, Hakim H1 item 1):
+# is_push_command must be anchored to a real command position — a `git
+# push` substring inside a grep pattern, an echo argument, a commit
+# message, or a shell comment must NEVER route to the push hooks.
+for command in \
+  "grep -r 'git push' ." \
+  'echo reminder: git push origin main' \
+  "git commit -m 'add a git push helper'" \
+  'true # cd /tmp then git push origin HEAD'; do
+  : > "$TMP/log"
+  run "$command"
+  if grep -q '^pre-push-gate.sh$' "$TMP/log"; then
+    echo "FAIL: '$command' incorrectly routed to the push hooks" >&2
+    exit 1
+  fi
+done
+
+# A subshell push (`( git push )`) and a compound one both still open a
+# real command position and must route.
+for command in \
+  '( git push origin HEAD )' \
+  'true && git push origin HEAD'; do
+  : > "$TMP/log"
+  run "$command"
+  [ "$(grep -c '^pre-push-gate.sh$' "$TMP/log")" -eq 1 ]
+done
+
 # A non-blocking hook failure must not suppress later gates.
 : > "$TMP/log"
 set +e

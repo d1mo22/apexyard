@@ -285,31 +285,28 @@ EOF
   rm -rf "$sb"
 }
 
-# -------------------- CASE 12: `cd <B> && git push` runs B's checks, not A's --------------------
-# Regression guard for me2resh/apexyard#1366: the session cwd (sandbox A)
-# carries a FAILING check; the push actually targets sandbox B (a `cd`
-# prefix), which carries a PASSING one. Before the fix, REPO_ROOT was
-# derived from `git rev-parse --show-toplevel` with no `-C`/`cd` awareness,
-# so A's failing check ran (and blocked) regardless of what was pushed.
+# -------------------- CASE 12: `cd <B> && git push` is IGNORED — A's checks run --------------------
+# Narrowed contract (me2resh/apexyard#1405 second-round review, Rex B2 /
+# Hakim H1 + H3): a leading `cd` is no longer resolved AT ALL. The push
+# runs against the WORKING DIRECTORY (sandbox A), never a `cd` target
+# named earlier in the command. A's failing check must run and block; B's
+# command (named only via the ignored `cd`) must never run. An advisory
+# NOTE about the ignored `cd` must appear on stderr.
 case12() {
   local a b
   a=$(make_sandbox)
   b=$(make_sandbox)
   cat > "$a/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "A-should-not-run", "run": "touch A_RAN; exit 1"}]}}
+{"pre_push": {"commands": [{"name": "A-should-run", "run": "exit 1"}]}}
 EOF
   cat > "$b/.claude/project-config.json" <<EOF
-{"pre_push": {"commands": [{"name": "B-should-run", "run": "touch $b/B_RAN"}]}}
+{"pre_push": {"commands": [{"name": "B-should-not-run", "run": "touch $b/B_RAN"}]}}
 EOF
   local payload; payload=$(push_json_for "$b" "cd")
-  run_hook "$a" "$payload" 0 "" "cd-prefix-targets-B-not-A"
-  if [ -f "$a/A_RAN" ]; then
-    echo "FAIL [cd-prefix-targets-B-not-A]: A's command ran; it should not have" >&2
-    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}cd-prefix-A-ran "
-  fi
-  if [ ! -f "$b/B_RAN" ]; then
-    echo "FAIL [cd-prefix-targets-B-not-A]: B's command did NOT run; it should have" >&2
-    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}cd-prefix-B-did-not-run "
+  run_hook "$a" "$payload" 2 "NOTE: pre-push-gate checked the working directory" "cd-prefix-is-ignored-A-runs"
+  if [ -f "$b/B_RAN" ]; then
+    echo "FAIL [cd-prefix-is-ignored-A-runs]: B's command ran; a leading cd must never be resolved" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}cd-prefix-B-ran "
   fi
   rm -rf "$a" "$b"
 }
@@ -343,32 +340,40 @@ EOF
   rm -rf "$a" "$b"
 }
 
-# -------------------- CASE 14: reverse direction --------------------
-# Same pair, pushed the other way: cwd=B, push targets A via a `cd`
-# prefix. A's failing command must now run and block.
+# -------------------- CASE 14: reverse direction, same "cd is ignored" contract --------------------
+# Same pair, pushed the other way: cwd=B, the command names A via a `cd`
+# prefix. Since `cd` is never resolved, B's OWN check must run — proving
+# the ignore-`cd` behavior holds regardless of which sandbox is $PWD.
 case14() {
   local a b
   a=$(make_sandbox)
   b=$(make_sandbox)
-  cat > "$a/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "A-should-run", "run": "exit 1"}]}}
+  cat > "$a/.claude/project-config.json" <<EOF
+{"pre_push": {"commands": [{"name": "A-should-not-run", "run": "touch $a/A_RAN"}]}}
 EOF
   cat > "$b/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "B-should-not-run", "run": "exit 1"}]}}
+{"pre_push": {"commands": [{"name": "B-should-run", "run": "exit 1"}]}}
 EOF
   local payload; payload=$(push_json_for "$a" "cd")
-  run_hook "$b" "$payload" 2 "A-should-run: FAILED" "reverse-direction-targets-A"
+  run_hook "$b" "$payload" 2 "B-should-run: FAILED" "reverse-direction-cd-still-ignored"
+  if [ -f "$a/A_RAN" ]; then
+    echo "FAIL [reverse-direction-cd-still-ignored]: A's command ran via the ignored cd target" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}reverse-cd-A-ran "
+  fi
   rm -rf "$a" "$b"
 }
 
 # -------------------- CASE 15: a session pin must NOT override the push target --------------------
-# The second half of #1366: the shared config reader prefers a session-
-# pinned ops root over `$PWD` (apexyard#381). Simulate a real session
-# pinned to sandbox C (a stand-in for "the operator's other, unrelated
-# fork") while pushing FROM A TO B via a `cd` prefix. Before the fix, the
-# pin made `config_get` read C's `.pre_push.commands` regardless of which
-# repo the push actually targeted; B_RAN / C_RAN prove which config was
-# actually used.
+# The second half of #1366, retested against the narrowed (`-C`-only)
+# resolution: the shared config reader prefers a session-pinned ops root
+# over `$PWD` (apexyard#381), AND `_config_repo_root`'s own walk-up would
+# otherwise resolve to whichever ops-fork-shaped ancestor it finds first
+# (me2resh/apexyard#1405 second-round review finding B1 / Rex probe P1).
+# Simulate a real session pinned to sandbox C (a stand-in for "the
+# operator's other, unrelated fork") while pushing to B via `git -C B
+# push`. Before this fix, EITHER the pin OR the walk-up could make
+# `config_get` read a repo other than the one the push actually targets;
+# B_RAN / C_RAN prove which config was actually used.
 case15() {
   local a b c
   a=$(make_sandbox)
@@ -387,7 +392,7 @@ EOF
 EOF
   local pin_dir; pin_dir=$(mktemp -d)
   printf '%s' "$c" > "$pin_dir/ops-root-test-session-1366"
-  local payload; payload=$(push_json_for "$b" "cd")
+  local payload; payload=$(push_json_for "$b" "-C")
   local stderr_file; stderr_file=$(mktemp)
   (
     cd "$a" || exit 1
@@ -463,12 +468,12 @@ EOF
   rm -rf "$sb" "$b"
 }
 
-# -------------------- CASE 17: `cd B && git -C sub push` joins to B, not to $PWD --------------------
-# Regression guard for me2resh/apexyard#1405 review item 2 (Rex) / A2
-# (Hakim): a RELATIVE `-C` value must join to the preceding `cd` target,
-# not to the session's own $PWD. `sub` is a relative name that resolves
-# ONLY when joined to `base`; joining it to the session dir would resolve
-# to a nonexistent path and fail closed instead of running sub's check.
+# -------------------- CASE 17: `cd B && git -C sub push` — relative `-C` joins to $PWD, never to the ignored `cd` --------------------
+# Narrowed contract (me2resh/apexyard#1405 second-round review): `cd` is
+# dropped entirely, so a RELATIVE `-C` value now joins ONLY to the
+# session's own $PWD, never to a preceding `cd` target. `sub_name` does
+# not exist relative to $a, so this must fail closed with the "cannot
+# resolve" BLOCKED message — not silently join to `base` and succeed.
 case17() {
   local a base sub sub_name
   a=$(make_sandbox)
@@ -481,42 +486,97 @@ case17() {
 {"pre_push": {"commands": [{"name": "A-should-not-run", "run": "touch A_RAN; exit 1"}]}}
 EOF
   cat > "$sub/.claude/project-config.json" <<EOF
-{"pre_push": {"commands": [{"name": "sub-should-run", "run": "touch $sub/SUB_RAN"}]}}
+{"pre_push": {"commands": [{"name": "sub-should-not-run", "run": "touch $sub/SUB_RAN"}]}}
 EOF
   local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "cd $base && git -C $sub_name push origin HEAD")
-  run_hook "$a" "$payload" 0 "" "cd-plus-relative-dash-C-joins-to-cd-target"
-  if [ -f "$a/A_RAN" ]; then
-    echo "FAIL [cd-plus-relative-dash-C-joins-to-cd-target]: A's command ran; it should not have" >&2
-    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}composed-cd-C-A-ran "
-  fi
-  if [ ! -f "$sub/SUB_RAN" ]; then
-    echo "FAIL [cd-plus-relative-dash-C-joins-to-cd-target]: sub's command did NOT run" >&2
-    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}composed-cd-C-sub-did-not-run "
+  run_hook "$a" "$payload" 2 "BLOCKED: pre-push-gate cannot resolve" "relative-dash-C-never-joins-to-ignored-cd"
+  if [ -f "$sub/SUB_RAN" ]; then
+    echo "FAIL [relative-dash-C-never-joins-to-ignored-cd]: sub's command ran; a relative -C must not join to an ignored cd target" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}composed-cd-C-sub-ran "
   fi
   rm -rf "$a" "$base"
 }
 
-# -------------------- CASE 18: an unresolved explicit target BLOCKS, never silently skips --------------------
+# -------------------- CASE 18: an unresolved explicit `-C` target BLOCKS, never silently skips --------------------
 # Regression guard for me2resh/apexyard#1405 review item 2 (Rex) / H1
-# item 2 (Hakim): a `cd`/`-C` target that is present but does not resolve
-# to a git repository (an unset shell variable, a command substitution, a
-# typo) must BLOCK, not exit 0 as though there were nothing to check.
+# item 2 (Hakim), retested against the `-C`-only contract: an explicit
+# `-C` target that does not resolve to a git repository (a typo, a path
+# that never existed) must BLOCK, not exit 0 as though there were nothing
+# to check. A bare (non-`-C`) `cd` to a nonexistent directory is now a
+# SEPARATE, non-blocking case — see case20 — because `cd` is never
+# resolved at all.
 case18() {
   local a
   a=$(make_sandbox)
   cat > "$a/.claude/project-config.json" <<'EOF'
 {"pre_push": {"commands": [{"name": "should-not-matter", "run": "exit 0"}]}}
 EOF
-  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "cd /this-directory-does-not-exist-h1405 && git push origin HEAD")
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "git -C /this-directory-does-not-exist-h1405 push origin HEAD")
   run_hook "$a" "$payload" 2 "BLOCKED: pre-push-gate cannot resolve" "unresolved-explicit-target-fails-closed"
   rm -rf "$a"
 }
 
-# -------------------- CASE 19: `cd ~/repo` resolves via $HOME, not a literal path join --------------------
-# Regression guard for me2resh/apexyard#1405 review item 2 (Rex) / H1
-# item 5 (Hakim): a tilde-prefixed `cd` target must expand against $HOME
-# and resolve to a real repo, not fail closed for lack of trying.
+# -------------------- CASE 20: `cd` to a nonexistent directory is ignored, not resolved-and-blocked --------------------
+# Narrowed contract: a bare `cd` (no `-C`) is dropped entirely, even when
+# the `cd` target does not exist. The gate falls back to the working
+# directory ($a, a valid repo with a passing check) and must exit 0 — the
+# nonexistent `cd` target is never itself resolved or blocked on.
+case20() {
+  local a
+  a=$(make_sandbox)
+  cat > "$a/.claude/project-config.json" <<'EOF'
+{"pre_push": {"commands": [{"name": "session-should-run", "run": "exit 0"}]}}
+EOF
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "cd /this-directory-does-not-exist-h1405 && git push origin HEAD")
+  run_hook "$a" "$payload" 0 "NOTE: pre-push-gate checked the working directory" "nonexistent-cd-target-is-ignored-not-blocked"
+  rm -rf "$a"
+}
+
+# -------------------- CASE 19: `cd ~/repo` is ignored — `~` expansion is tested on `-C` instead --------------------
+# Narrowed contract: a `cd` (tilde-prefixed or not) is never resolved.
+# `~/repo`'s command must NOT run; the session's own (failing) check runs
+# and blocks. Tilde EXPANSION itself is retested below on a `-C` value
+# (case21), since that is the only path that still resolves a target.
 case19() {
+  local a fake_home target
+  a=$(make_sandbox)
+  fake_home=$(mktemp -d)
+  target=$(make_sandbox)
+  mv "$target" "$fake_home/repo"
+  target="$fake_home/repo"
+  cat > "$a/.claude/project-config.json" <<'EOF'
+{"pre_push": {"commands": [{"name": "A-should-run", "run": "exit 1"}]}}
+EOF
+  cat > "$target/.claude/project-config.json" <<EOF
+{"pre_push": {"commands": [{"name": "tilde-should-not-run", "run": "touch $target/TILDE_RAN"}]}}
+EOF
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "cd ~/repo && git push origin HEAD")
+  local stderr_file; stderr_file=$(mktemp)
+  (
+    cd "$a" || exit 1
+    export HOME="$fake_home"
+    echo "$payload" | bash .claude/hooks/pre-push-gate.sh 2>"$stderr_file"
+  )
+  local rc=$?
+  local got_stderr; got_stderr=$(cat "$stderr_file" 2>/dev/null)
+  rm -f "$stderr_file"
+  if [ "$rc" != "2" ]; then
+    echo "FAIL [tilde-cd-is-ignored]: want rc=2, got $rc (stderr: ${got_stderr:0:200})" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}tilde-cd-rc "
+  elif [ -f "$target/TILDE_RAN" ]; then
+    echo "FAIL [tilde-cd-is-ignored]: ~/repo's command ran; a leading cd must never be resolved" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}tilde-cd-target-ran "
+  else
+    echo "PASS [tilde-cd-is-ignored]"
+    PASS=$((PASS + 1))
+  fi
+  rm -rf "$a" "$fake_home"
+}
+
+# -------------------- CASE 21: `git -C ~/repo push` resolves `~` via $HOME --------------------
+# `~` expansion (Hakim H1 item 5) still applies to the ONE thing this gate
+# resolves: a `-C` value bound directly to the push.
+case21() {
   local a fake_home target
   a=$(make_sandbox)
   fake_home=$(mktemp -d)
@@ -529,7 +589,7 @@ EOF
   cat > "$target/.claude/project-config.json" <<EOF
 {"pre_push": {"commands": [{"name": "tilde-should-run", "run": "touch $target/TILDE_RAN"}]}}
 EOF
-  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "cd ~/repo && git push origin HEAD")
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "git -C ~/repo push origin HEAD")
   local stderr_file; stderr_file=$(mktemp)
   (
     cd "$a" || exit 1
@@ -540,23 +600,79 @@ EOF
   local got_stderr; got_stderr=$(cat "$stderr_file" 2>/dev/null)
   rm -f "$stderr_file"
   if [ "$rc" != "0" ]; then
-    echo "FAIL [tilde-cd-resolves-via-home]: want rc=0, got $rc (stderr: ${got_stderr:0:200})" >&2
-    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}tilde-cd-rc "
+    echo "FAIL [dash-C-tilde-resolves-via-home]: want rc=0, got $rc (stderr: ${got_stderr:0:200})" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}dash-C-tilde-rc "
   elif [ -f "$a/A_RAN" ]; then
-    echo "FAIL [tilde-cd-resolves-via-home]: the session repo's command ran instead of ~/repo's" >&2
-    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}tilde-cd-A-ran "
+    echo "FAIL [dash-C-tilde-resolves-via-home]: the session repo's command ran instead of ~/repo's" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}dash-C-tilde-A-ran "
   elif [ ! -f "$target/TILDE_RAN" ]; then
-    echo "FAIL [tilde-cd-resolves-via-home]: ~/repo's command did NOT run" >&2
-    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}tilde-cd-target-did-not-run "
+    echo "FAIL [dash-C-tilde-resolves-via-home]: ~/repo's command did NOT run" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}dash-C-tilde-target-did-not-run "
   else
-    echo "PASS [tilde-cd-resolves-via-home]"
+    echo "PASS [dash-C-tilde-resolves-via-home]"
     PASS=$((PASS + 1))
   fi
   rm -rf "$a" "$fake_home"
 }
 
+# -------------------- CASE 22-25: command-position anchoring — negative cases --------------------
+# me2resh/apexyard#1405 second-round review, Rex B2 / Hakim H1 item 1: a
+# `git push` (or `git -C ... push`) substring inside a grep pattern, an
+# echo argument, a commit message, or a shell comment must NEVER be read
+# as a real push — this hook must exit 0 with no stderr output at all
+# (proving the check suite never ran), even though the session repo's
+# check is FAILING.
+_anchor_negative_case() {
+  local label="$1" cmd="$2"
+  local a; a=$(make_sandbox)
+  cat > "$a/.claude/project-config.json" <<'EOF'
+{"pre_push": {"commands": [{"name": "should-never-run", "run": "exit 1"}]}}
+EOF
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "$cmd")
+  run_hook "$a" "$payload" 0 "" "$label"
+  rm -rf "$a"
+}
+case22() { _anchor_negative_case "grep-containing-git-push-is-not-a-push" 'grep -r "git push" .'; }
+case23() { _anchor_negative_case "echo-containing-git-push-is-not-a-push" 'echo "reminder: git push origin main"'; }
+case24() { _anchor_negative_case "commit-message-mentioning-git-push-is-not-a-push" 'git commit -m "add a git push helper"'; }
+case25() { _anchor_negative_case "comment-containing-git-push-is-not-a-push" 'true # cd /tmp then git push origin HEAD'; }
+
+# -------------------- CASE 26: nested `workspace/<name>` layout — config comes from the pushed project, not the ops fork --------------------
+# me2resh/apexyard#1405 second-round review finding B1 (Rex probe P1): the
+# documented default layout (CLAUDE.md — a project cloned under
+# `workspace/<name>/` inside the ops fork) must run the PROJECT's own
+# `.pre_push.commands`, never the ops fork's, when pushed via
+# `git -C workspace/proj push`.
+case26() {
+  local ops proj
+  ops=$(make_sandbox)
+  touch "$ops/.apexyard-fork"
+  mkdir -p "$ops/workspace"
+  proj=$(make_sandbox)
+  mv "$proj" "$ops/workspace/proj"
+  proj="$ops/workspace/proj"
+  cat > "$ops/.claude/project-config.json" <<EOF
+{"pre_push": {"commands": [{"name": "ops-should-not-run", "run": "touch $ops/OPS_RAN; exit 1"}]}}
+EOF
+  cat > "$proj/.claude/project-config.json" <<EOF
+{"pre_push": {"commands": [{"name": "proj-should-run", "run": "touch $proj/PROJ_RAN"}]}}
+EOF
+  local payload; payload=$(printf '{"tool_input":{"command":"%s"}}' "git -C workspace/proj push origin HEAD")
+  run_hook "$ops" "$payload" 0 "" "workspace-nested-layout-uses-project-config"
+  if [ -f "$ops/OPS_RAN" ]; then
+    echo "FAIL [workspace-nested-layout-uses-project-config]: the ops fork's command ran instead of the project's" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}workspace-nested-ops-ran "
+  fi
+  if [ ! -f "$proj/PROJ_RAN" ]; then
+    echo "FAIL [workspace-nested-layout-uses-project-config]: the project's command did NOT run" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}workspace-nested-proj-did-not-run "
+  fi
+  rm -rf "$ops"
+}
+
 case1; case2; case3; case4; case5; case6; case7; case8; case9; case10; case11
-case12; case13; case14; case15; case16; case17; case18; case19
+case12; case13; case14; case15; case16; case17; case18; case19; case20; case21
+case22; case23; case24; case25; case26
 
 echo ""
 echo "==================================="

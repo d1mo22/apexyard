@@ -96,8 +96,67 @@ the check-runner. It does not go beyond it.
   already copies `_lib-read-config.sh` next to the hook in each sandbox,
   so `HOOK_DIR`-based sourcing needs no test-harness change.
 
+## Round 2 addendum — narrower resolution, corrected claims (me2resh/apexyard#1405 second review)
+
+The first round of this AgDR shipped two inaccurate statements. Rex's
+probe P1 and Hakim's H1/H3 findings on the second review round showed
+both were wrong, not just imprecise.
+
+**Correction 1 — the config data did NOT resolve against `$REPO_ROOT`.**
+The Decision section above (item 2) said `config_get` resolves the
+config data against `$PWD`, which the hook had already `cd`-ed into
+`$REPO_ROOT`. Rex's probe P1 built an ops repo with `.apexyard-fork` and
+a nested `workspace/proj` clone, pushed via `-C workspace/proj`, and
+observed the OPS FORK's `.pre_push.commands` run against the project's
+files. The reason: `_config_repo_root` (inside `_lib-read-config.sh`)
+does not stop at `$PWD` — it walks UP looking for the nearest
+`.apexyard-fork` (or v1 onboarding pair) ancestor, per AgDR-0118, and for
+the documented `workspace/<name>/` layout that walk finds the ops fork
+before it finds `$REPO_ROOT`. A session pin (apexyard#381) can do the
+same thing from a different direction. Fix: `pre-push-gate.sh` now sets
+`_CONFIG_ROOT_CACHE="$REPO_ROOT"` immediately after sourcing the library,
+which short-circuits `_config_repo_root`'s cache check before any walk-up
+or pin lookup runs. The config now always comes from `$REPO_ROOT` itself,
+with no exception.
+
+**Correction 2 — the trust boundary DID change, and not only in the
+direction #1366 intended.** The original Decision said any git
+repository a push resolves to may supply `.pre_push.commands`, "unchanged
+from #1366's own design," and the Consequences section said a target
+repo "cannot steer which CODE runs, only which DATA." Both undersold the
+actual change. Before #1366, the command TEXT could not choose the
+config source at all — the hook always ran the session repo's own
+commands. After #1366 shipped (and before this round's fix), the
+resolution logic scanned the WHOLE command for any `cd` or `-C` value,
+with no anchor to a real command position — so a comment, an unrelated
+`echo`, or a later unrelated git invocation could make the hook read (and
+run) a DIFFERENT repository's declared commands, including one a
+`PreToolUse` hook reaches before the operator's permission decision
+(Hakim H1). That is a materially wider trust surface than "the session
+repo runs its own commands," and the original Consequences section
+described it as unchanged. It was not.
+
+**The fix, this round:** resolution now trusts exactly one thing — a
+`-C` (or `--git-dir`, detection-only) flag bound directly to the actual
+`git ... push` invocation, matched only at a real command position (the
+start of the command, or immediately after `&&`/`||`/`;`/`|`). Nothing
+else is scanned. This closes the crafted-command class of finding (Hakim
+H3): an echo, a comment, or an unrelated later git call can no longer
+steer which repository's commands run.
+
+**Accepted limit — a leading `cd` is never resolved.** The first round
+also let a `cd <dir> &&` prefix set the pushed repo, and joined a
+relative `-C` value to that `cd` target instead of to `$PWD`. Both
+were themselves sources of misreadable, unanchored text. This round
+drops `cd`-text parsing entirely: a compound command that changes
+directory before pushing runs against the WORKING DIRECTORY instead,
+with a one-line advisory on stderr, never against the `cd` target. This
+is a deliberate narrowing, not an oversight — `git -C <dir> push` remains
+the supported way to check a different repository's commands before
+pushing to it.
+
 ## Artifacts
 
 - Issue: me2resh/apexyard#1366
-- Review: me2resh/apexyard#1405 (Rex item 3, Hakim A1)
+- Review: me2resh/apexyard#1405 (round 1: Rex item 3, Hakim A1; round 2: Rex B1/B2, Hakim H1/H3)
 - Related: docs/agdr/AgDR-0169-dispatcher-fail-closed-merge-gates.md

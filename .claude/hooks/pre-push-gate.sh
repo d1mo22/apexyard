@@ -11,7 +11,7 @@
 # was self-discipline; now it's mechanical.
 #
 # Silent pass conditions (exit 0, no output):
-#   - Not a `git push` command.
+#   - No real `git push` at command position (see below).
 #   - No `.claude/project-config.defaults.json` AND no `package.json` in the
 #     repo → treat as a non-runnable repo (docs-only, newly-forked, etc.).
 #   - HEAD commit subject contains the skip marker `<!-- pre-push: skip -->`
@@ -27,6 +27,21 @@
 # Skip marker: include the literal string `<!-- pre-push: skip -->` in the
 # HEAD commit message (subject or body) to bypass for that one push.
 # The hook prints the bypassed command set to stderr so the skip is visible.
+#
+# SCOPE (me2resh/apexyard#1405 second-round review — narrowed from the
+# first fix's `cd`/`-C` scan)
+# --------------------------------------------------------------------------
+# This hook resolves the pushed repository from ONE source only: a `-C`
+# (or `--git-dir`) flag bound directly to the actual `git ... push`
+# invocation. A leading `cd <dir>` is NEVER resolved — Rex (B2) and Hakim
+# (H1/H3) both found that scanning command text for a `cd` target, even
+# scoped to "before the push clause", is not anchored to a real command
+# position and can be steered by a crafted command (an echo, a comment, a
+# relative `cd .` chain). Dropping `cd`-text parsing entirely removes that
+# whole class of finding. A compound command that `cd`s before pushing
+# falls back to the working directory and prints a one-line advisory —
+# see docs/agdr/AgDR-0170-pre-push-trust-boundary.md for the accepted
+# limit this narrowing records.
 
 # HOOK_DIR: this file's own directory, used below to source the shared
 # config-reading library from a fixed, trusted location — never from the
@@ -41,57 +56,150 @@ if [ -z "$COMMAND" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Recognise a push, and isolate its OWN clause — never scan the whole
-# command line for a `cd` / `-C` value (me2resh/apexyard#1405 review items
-# 1-2, Hakim H1).
+# Recognise a push AT COMMAND POSITION ONLY — the start of the whole
+# command, or immediately after a top-level `&&`, `||`, `;`, or `|`. Never
+# a bare `git push` substring appearing inside a quoted argument, a
+# grep/echo pattern, a commit message, or a shell comment (me2resh/apexyard
+# #1405 review, Rex B2 / Hakim H1 item 1). The previous version matched
+# `\bgit...push\b` ANYWHERE in the command text, so a read-only search or a
+# commit message that only MENTIONS a push ran this hook's full check
+# suite — including, worst case, a repo-declared `.pre_push.commands` list
+# from whatever `-C` value happened to sit nearby in the same string.
 #
-# One regex matches either `git push` or `git -C <dir> push` as ONE
-# contiguous invocation, `git` and `push` as their own words. That single
-# match is what:
-#   - stops a `-C` that belongs to an EARLIER, unrelated git call
-#     (`git -C A status && git push`) from being read as this push's own
-#     target — the match only succeeds at the SECOND `git`, where the
-#     optional `-C` group is empty, so the hook correctly falls back to
-#     $PWD instead of resolving to A;
-#   - stops text AFTER the push (a trailing `cd`, a `-C`, a shell comment,
-#     an `echo`, `cd -`/`cd ..`/`cd ~/x`, a push-option value) from being
-#     read as a target at all — none of that text is part of this match,
-#     so H1's seven trailing-command bypass shapes never reach the
-#     extraction below.
+# Splitting on `&&`/`||`/`;`/`|` is a naive text substitution — NOT quote-
+# aware, the same accepted limit this framework's other command splitters
+# already carry (see `_lib-detect-bash-write.sh`'s `_bdw_split_top_level`,
+# not sourced here on purpose — that file has two contributor PRs open
+# against it and this hook needs an independent copy anyway, same shape as
+# the existing `\bgit\s+push\b` duplication across block-main-push.sh /
+# validate-branch-name.sh / dispatch-bash.sh's `is_push_command`). A
+# physical newline in COMMAND is already a segment boundary for free — the
+# `while read` loop below reads line by line.
 # ---------------------------------------------------------------------------
-PUSH_CLAUSE=$(printf '%s' "$COMMAND" \
-  | grep -oE '\bgit[[:space:]]+(-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:];&|]+)[[:space:]]+)?push\b' \
-  | head -n 1)
+_pp_split_segments() {
+  local cmd="$1"
+  local split="$cmd"
+  split="${split//&&/$'\n'}"
+  split="${split//||/$'\n'}"
+  split="${split//;/$'\n'}"
+  split="${split//|/$'\n'}"
+  printf '%s\n' "$split"
+}
 
-if [ -z "$PUSH_CLAUSE" ]; then
+# _pp_trim <text>: strips leading whitespace and any leading subshell `(`
+# characters (with the whitespace after them) — a subshell push,
+# `( git push )`, still opens a real command position.
+_pp_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  while [ "${s:0:1}" = "(" ]; do
+    s="${s:1}"
+    s="${s#"${s%%[![:space:]]*}"}"
+  done
+  printf '%s' "$s"
+}
+
+# _pp_strip_env_assignments <text>: drops leading `VAR=value ` tokens
+# (e.g. `GIT_DIR=x git push`) — allowed before `git` per the anchor rule.
+_pp_strip_env_assignments() {
+  local s="$1"
+  while printf '%s' "$s" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]'; do
+    s=$(printf '%s' "$s" | sed -E 's/^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+//')
+  done
+  printf '%s' "$s"
+}
+
+# _pp_consume_flags <text-after-"git ">: strips zero or more leading
+# `-C <val>` / `--git-dir <val>` tokens and echoes what remains. Used both
+# to check whether `push` is the next word (detection) and, on the matched
+# segment, to walk the SAME flags again while collecting `-C` values.
+_pp_consume_flags() {
+  local rest="$1"
+  while :; do
+    if printf '%s' "$rest" | grep -qE '^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      rest=$(printf '%s' "$rest" | sed -E 's/^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    if printf '%s' "$rest" | grep -qE '^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      rest=$(printf '%s' "$rest" | sed -E 's/^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    break
+  done
+  printf '%s' "$rest"
+}
+
+# _pp_is_push_segment <segment>: does this ONE top-level segment start
+# with a real `git ... push` invocation (optional leading env assignments,
+# optional `-C`/`--git-dir` flags in between)?
+_pp_is_push_segment() {
+  local t stripped rest
+  t="$(_pp_trim "$1")"
+  [ -z "$t" ] && return 1
+  stripped="$(_pp_strip_env_assignments "$t")"
+  printf '%s' "$stripped" | grep -qE '^git([[:space:]]|$)' || return 1
+  rest="$(printf '%s' "$stripped" | sed -E 's/^git[[:space:]]*//')"
+  rest="$(_pp_consume_flags "$rest")"
+  printf '%s' "$rest" | grep -qE '^push([[:space:]]|$)'
+}
+
+# _pp_c_values <segment>: echoes each `-C` value found on the matched push
+# segment, one per line, in left-to-right order (a `--git-dir` value is
+# skipped — it names the .git directory, not the working tree, and is not
+# resolvable the same way).
+_pp_c_values() {
+  local stripped rest val
+  stripped="$(_pp_strip_env_assignments "$(_pp_trim "$1")")"
+  rest="$(printf '%s' "$stripped" | sed -E 's/^git[[:space:]]*//')"
+  while :; do
+    if printf '%s' "$rest" | grep -qE '^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      val=$(printf '%s' "$rest" | grep -oE -- '^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)' | sed -E "s/^-C[[:space:]]+//; s/^[\"']//; s/[\"']\$//")
+      printf '%s\n' "$val"
+      rest=$(printf '%s' "$rest" | sed -E 's/^-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    if printf '%s' "$rest" | grep -qE '^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)([[:space:]]|$)'; then
+      rest=$(printf '%s' "$rest" | sed -E 's/^--git-dir(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]*//')
+      continue
+    fi
+    break
+  done
+}
+
+# Walk the top-level segments in order. The FIRST one that is a real push
+# governs this hook — everything after it (a trailing `-C`, `cd`, comment,
+# echo, or push-option value) is never consulted. Also note whether any
+# segment BEFORE the push was a `cd` — advisory only, `cd` is never
+# resolved.
+PUSH_SEG=""
+FOUND_PUSH=0
+HAD_CD_PREFIX=0
+# A here-string (`<<<`), not process substitution (`< <(...)`) — process
+# substitution is a syntax ERROR under POSIXLY_CORRECT / `bash --posix`
+# (verified empirically). A here-string keeps the loop in the CURRENT
+# shell, same as process substitution would, so PUSH_SEG/FOUND_PUSH/
+# HAD_CD_PREFIX still persist past the loop.
+_SEGMENTS="$(_pp_split_segments "$COMMAND")"
+while IFS= read -r _seg; do
+  _t="$(_pp_trim "$_seg")"
+  [ -z "$_t" ] && continue
+  if [ "$FOUND_PUSH" -eq 0 ] && _pp_is_push_segment "$_t"; then
+    PUSH_SEG="$_t"
+    FOUND_PUSH=1
+    continue
+  fi
+  if [ "$FOUND_PUSH" -eq 0 ] && printf '%s' "$_t" | grep -qE '^cd([[:space:]]|$)'; then
+    HAD_CD_PREFIX=1
+  fi
+done <<< "$_SEGMENTS"
+
+if [ "$FOUND_PUSH" -eq 0 ]; then
   exit 0
 fi
 
-# `-C <dir>` extracted from the push clause itself, never from the rest of
-# the command — this is the ONLY `-C` this hook will ever honour.
-PUSH_C_VALUE=""
-if echo "$PUSH_CLAUSE" | grep -qE -- '-C[[:space:]]+'; then
-  PUSH_C_VALUE=$(echo "$PUSH_CLAUSE" \
-    | grep -oE -- "-C[[:space:]]+(\"[^\"]*\"|'[^']*'|[^[:space:];&|]+)" \
-    | sed -E "s/^-C[[:space:]]+//; s/^[\"']//; s/[\"']\$//")
-fi
-
-# The text BEFORE the push clause — the only place a `cd` that sets this
-# push's cwd can appear. Everything from the push clause onward is dropped,
-# so a trailing `cd`/comment/echo/push-option value is never scanned.
-PREFIX="${COMMAND%%"$PUSH_CLAUSE"*}"
-
-CD_TARGET=""
-if echo "$PREFIX" | grep -qE '\bcd[[:space:]]+\S'; then
-  CD_TARGET=$(echo "$PREFIX" \
-    | grep -oE "cd[[:space:]]+(\"[^\"]*\"|'[^']*'|[^[:space:];&|]+)" \
-    | tail -n 1 \
-    | sed -E "s/^cd[[:space:]]+//; s/^[\"']//; s/[\"']\$//")
-fi
-
 # _resolve_dir <value> <base>: joins a relative path to <base>, expanding
-# a leading `~` against $HOME (Hakim H1 item 5 — `cd ~/repo` must resolve
-# a real target, not just fail closed for lack of trying).
+# a leading `~` against $HOME (Hakim H1 item 5 — `~`-prefixed values must
+# resolve a real target, not just fail closed for lack of trying).
 _resolve_dir() {
   local dir="$1" base="$2"
   case "$dir" in
@@ -106,35 +214,33 @@ _resolve_dir() {
   printf '%s' "$dir"
 }
 
-CD_RESOLVED=""
-if [ -n "$CD_TARGET" ]; then
-  CD_RESOLVED=$(_resolve_dir "$CD_TARGET" "$PWD")
-fi
-
-# Compose: `git -C <dir> push` wins over a preceding `cd` when both appear,
-# but a RELATIVE `-C` value now joins to the `cd` target, not to $PWD — the
-# `cd B && git -C sub push` bug in the #1405 review (Rex item 2 / Hakim A2).
-# Neither present: fall back to $PWD, unchanged for the common single-repo
-# session.
+# Resolve the target directory from the push segment's OWN `-C` value(s)
+# only — never from a `cd` anywhere in the command (dropped entirely, see
+# the SCOPE note at the top of this file). Multiple `-C` flags on the same
+# invocation join progressively, left to right, mirroring git's own
+# repeated-`-C` semantics (Hakim A2) — each later relative value joins to
+# the directory the previous one resolved, not to $PWD.
 TARGET_EXPLICIT=0
-if [ -n "$PUSH_C_VALUE" ]; then
+PUSH_TARGET_DIR="$PWD"
+_base="$PWD"
+_saw_c=0
+_CVALS="$(_pp_c_values "$PUSH_SEG")"
+while IFS= read -r _cval; do
+  [ -z "$_cval" ] && continue
+  _saw_c=1
+  _base="$(_resolve_dir "$_cval" "$_base")"
+done <<< "$_CVALS"
+if [ "$_saw_c" -eq 1 ]; then
   TARGET_EXPLICIT=1
-  BASE_FOR_C="$PWD"
-  [ -n "$CD_RESOLVED" ] && BASE_FOR_C="$CD_RESOLVED"
-  PUSH_TARGET_DIR=$(_resolve_dir "$PUSH_C_VALUE" "$BASE_FOR_C")
-elif [ -n "$CD_RESOLVED" ]; then
-  TARGET_EXPLICIT=1
-  PUSH_TARGET_DIR="$CD_RESOLVED"
-else
-  PUSH_TARGET_DIR="$PWD"
+  PUSH_TARGET_DIR="$_base"
 fi
 
 REPO_ROOT=$(git -C "$PUSH_TARGET_DIR" rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then
-  # A target was named (via `cd` or `-C`) and it does not resolve to a git
+  # An explicit `-C` target was named and it does not resolve to a git
   # repository: BLOCK instead of silently skipping every check
   # (me2resh/apexyard#1405 review item 2, Hakim H1 item 2 — "do not skip").
-  # The bare-$PWD case (no cd/-C at all) keeps the pre-#1366 behaviour: if
+  # The bare-$PWD case (no `-C` at all) keeps the pre-#1366 behaviour: if
   # the session repo itself is not a git repo, `git push` will fail on its
   # own and this hook running is moot.
   if [ "$TARGET_EXPLICIT" -eq 1 ]; then
@@ -143,19 +249,32 @@ BLOCKED: pre-push-gate cannot resolve the repository this push targets.
 Resolved target: ${PUSH_TARGET_DIR}
 This is not a git repository, or this shell cannot reach it. A gate that
 cannot verify its target fails closed instead of skipping every check.
-Fix the cd/-C target and push again.
+Fix the -C target and push again.
 MSG
     exit 2
   fi
   exit 0
 fi
 
+# A leading `cd` was present but is never resolved — say so, since the
+# gate is about to check the working directory instead of wherever that
+# `cd` pointed. Non-blocking; the accepted limit is recorded in
+# docs/agdr/AgDR-0170-pre-push-trust-boundary.md.
+if [ "$HAD_CD_PREFIX" -eq 1 ] && [ "$TARGET_EXPLICIT" -eq 0 ]; then
+  cat >&2 <<MSG
+NOTE: pre-push-gate checked the working directory (${PWD}), not a
+'cd' target named earlier in this command. A leading 'cd' is an
+accepted limit of this gate — use 'git -C <dir> push' to target a
+different repository.
+MSG
+fi
+
 # Move into the target repo NOW, before the config lookup below. The
 # shared config reader (`_lib-read-config.sh`) resolves its own repo root
-# from `$PWD`, so calling it while `$PWD` is still the session's original
-# directory reads the WRONG repo's `.pre_push.commands` — the second half
-# of #1366 ("the commands can be read from one repo's config and executed
-# against a different repo").
+# from `$PWD` (or an ops-root walk-up), so calling it while `$PWD` is still
+# the session's original directory reads the WRONG repo's
+# `.pre_push.commands` — the second half of #1366 ("the commands can be
+# read from one repo's config and executed against a different repo").
 cd "$REPO_ROOT" || exit 0
 
 # ---------------------------------------------------------------------------
@@ -187,23 +306,32 @@ CMDS_JSON=""
 # code-execution path with no independent trust check. The library that
 # INTERPRETS `.pre_push.commands` always comes from the hook's own,
 # framework-controlled copy; only the CONFIG DATA (JSON already read from
-# $PWD via `config_get`, which resolves against the target repo we already
-# `cd`-ed into above) comes from the target repo — the same trust boundary
-# this hook has had since before #1366: a repo's `.pre_push.commands` was
-# always free to declare arbitrary shell commands, run via `bash -c` below;
-# only the INTERPRETER's location changes here, not what a repo may
-# configure. See docs/agdr/AgDR-0170-pre-push-trust-boundary.md.
+# $REPO_ROOT via `config_get`, forced below) comes from the target repo —
+# the same trust boundary this hook has had since before #1366: a repo's
+# `.pre_push.commands` was always free to declare arbitrary shell commands,
+# run via `bash -c` below; only the INTERPRETER's location changes here,
+# not what a repo may configure. See
+# docs/agdr/AgDR-0170-pre-push-trust-boundary.md.
 if [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
   . "$HOOK_DIR/_lib-read-config.sh"
-  # APEXYARD_OPS_DISABLE_PIN=1: the shared reader's `_config_repo_root`
-  # prefers a session-pinned ops root over `$PWD` (apexyard#381), which
-  # is right for a marker write but wrong here — this gate must read the
-  # config of the repo it is ABOUT TO RUN COMMANDS AGAINST ($REPO_ROOT,
-  # already `cd`-ed into above), not the operator's other, pinned fork.
-  # Unset, this was the second half of #1366: commands read from one
-  # repo's config, executed against a different one.
-  CMDS_JSON=$(APEXYARD_OPS_DISABLE_PIN=1 config_get '.pre_push.commands' 2>/dev/null)
+  # Force the config reader to treat $REPO_ROOT as the config root,
+  # bypassing `_config_repo_root`'s ops-fork walk-up entirely. Without
+  # this, `_config_repo_root` walks UP from $REPO_ROOT looking for the
+  # nearest `.apexyard-fork` (or v1 onboarding.yaml + apexyard.projects.
+  # yaml) ancestor — which, for the documented `workspace/<name>/` layout,
+  # resolves to the OPS FORK itself, not the pushed project, and the gate
+  # would run the ops fork's `.pre_push.commands` against the PROJECT's
+  # files (me2resh/apexyard#1405 review finding B1, Rex probe P1). Setting
+  # the cache directly is the fix Rex's own review suggested — `config_get`
+  # -> `_config_defaults_file` / `_config_overrides_file` ->
+  # `_config_repo_root` all short-circuit on this cache before any walk-up
+  # or session-pin lookup runs, so this REPLACES the previous
+  # `APEXYARD_OPS_DISABLE_PIN=1` approach rather than adding to it — that
+  # env var only disabled the PIN half of resolution, not the walk-up half
+  # B1 actually found broken.
+  _CONFIG_ROOT_CACHE="$REPO_ROOT"
+  CMDS_JSON=$(config_get '.pre_push.commands' 2>/dev/null)
 fi
 
 # Check that the config actually contains commands. Silent skip if not —
