@@ -202,6 +202,11 @@ fi
 # resolve a real target, not just fail closed for lack of trying).
 _resolve_dir() {
   local dir="$1" base="$2"
+  # Quoting IS required here, despite shellcheck SC2088: bash tilde-
+  # expands an UNQUOTED `~` in a case pattern (verified — an unquoted
+  # `~|~/*)` pattern expands against $HOME and then never matches a
+  # literal "~/repo" string). Quoting is what keeps the pattern literal.
+  # shellcheck disable=SC2088
   case "$dir" in
     "~"|"~/"*)
       if [ -n "${HOME:-}" ]; then
