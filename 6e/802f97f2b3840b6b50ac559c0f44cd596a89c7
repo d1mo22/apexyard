@@ -1,0 +1,19 @@
+.gitignore
+  s_365c94c513170b::t_988bb07c94c208 80-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "6e802f97f2b3840b6b50ac559c0f44cd596a89c7",
+  "prompts": {},
+  "sessions": {
+    "s_365c94c513170b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_365c94c513170b",
+        "model": "unknown"
+      },
+      "human_author": "David Morais <118942054+d1mo22@users.noreply.github.com>"
+    }
+  }
+}
