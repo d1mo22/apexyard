@@ -3,6 +3,13 @@
 #
 # Git invokes this from the repository that owns the index. The scanner reads
 # indexed blobs, not a rendered diff, so it protects every commit version.
+#
+# Matching lives in _lib-private-refs-match.sh (shared with the push-time
+# scan — me2resh/apexyard#1528 / AgDR-0220). Behaviour is unchanged except:
+# when origin is confirmed private by the same remote classification the
+# push scan uses, this staged scan exits 0. The protected-branch guard in
+# .githooks/pre-commit still runs. Origins that are public, unknown, or
+# only proven public via the #1477 offline path still run this scan.
 
 set -u
 
@@ -12,78 +19,42 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 
 HOOK_DIR="$ROOT/.claude/hooks"
-REGISTRY="$ROOT/apexyard.projects.yaml"
-if [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ]; then
-  # shellcheck source=/dev/null
-  . "$HOOK_DIR/_lib-portfolio-paths.sh"
-  resolved_registry=$(portfolio_registry 2>/dev/null || true)
-  [ -n "$resolved_registry" ] && REGISTRY="$resolved_registry"
+_SELF_DIR=$(CDPATH="" cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+
+_source_lib() {
+  local name="$1" path
+  for path in "$_SELF_DIR/$name" "$HOOK_DIR/$name"; do
+    if [ -f "$path" ]; then
+      # shellcheck source=/dev/null
+      . "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! _source_lib "_lib-private-refs-match.sh"; then
+  echo "BLOCKED: _lib-private-refs-match.sh is missing. Cannot safely scan staged content for a private portfolio reference." >&2
+  exit 2
 fi
 
-# A framework checkout without a private portfolio registry has no private
-# identifier set to enforce. A split-portfolio registry can live outside this
-# Git worktree and is still read through portfolio_registry above.
-[ -f "$REGISTRY" ] || exit 0
+# Load the registry first: a repo with nothing to scan never needs a
+# visibility lookup (and never calls gh).
+private_refs_match_init
+init_rc=$?
+[ "$init_rc" -eq 1 ] && exit 0
+[ "$init_rc" -eq 2 ] && exit 2
 
-current_repo=""
-origin_url=$(git remote get-url origin 2>/dev/null || true)
-current_repo=$(printf '%s' "$origin_url" | sed -nE 's|.*github\.com[:/]([^/]+/[^/]+)(\.git)?$|\1|p' | sed 's/\.git$//')
-current_name=${current_repo##*/}
-
-names=()
-repos=()
-workspaces=()
-while IFS= read -r entry; do
-  case "$entry" in
-    NAME=*) names+=("${entry#NAME=}") ;;
-    REPO=*) repos+=("${entry#REPO=}") ;;
-    WORKSPACE=*) workspaces+=("${entry#WORKSPACE=}") ;;
-  esac
-done < <(awk '
-  function unquote(value) { gsub(/^['\''\"]|['\''\"]$/, "", value); return value }
-  /^[[:space:]]*- name:/ {
-    print "NAME=" unquote($3); current_list = ""; next
-  }
-  /^[[:space:]]*repo:/ {
-    print "REPO=" unquote($2); current_list = ""; next
-  }
-  /^[[:space:]]*workspace:/ {
-    print "WORKSPACE=" unquote($2); current_list = ""; next
-  }
-  /^[[:space:]]*repos:[[:space:]]*\[/ {
-    value = $0; sub(/^[^\[]*\[/, "", value); sub(/\].*$/, "", value)
-    count = split(value, items, ",")
-    for (i = 1; i <= count; i++) {
-      item = items[i]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
-      if (item != "") print "REPO=" unquote(item)
-    }
-    current_list = ""; next
-  }
-  /^[[:space:]]*repos:[[:space:]]*(#.*)?$/ { current_list = "repos"; next }
-  /^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*:/ { current_list = ""; next }
-  /^[[:space:]]*-[[:space:]]+/ {
-    if (current_list == "repos") {
-      value = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", value)
-      gsub(/[[:space:]]+$/, "", value); print "REPO=" unquote(value)
-    }
-  }
-' "$REGISTRY")
-
-[ "${#names[@]}" -gt 0 ] || [ "${#repos[@]}" -gt 0 ] || [ "${#workspaces[@]}" -gt 0 ] || exit 0
-
-registry_rel=""
-case "$REGISTRY" in
-  "$ROOT"/*) registry_rel=${REGISTRY#"$ROOT"/} ;;
-esac
-
-escape_regex() {
-  printf '%s' "$1" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g'
-}
-
-staged_blob_matches() {
-  local path="$1" regex="$2"
-  git show ":$path" 2>/dev/null | grep -qiE "$regex"
-}
+# #1528 — skip the staged content scan only when origin is confirmed
+# private (fresh cache or live lookup). Failure / unknown / public-class
+# → scan as before. Missing visibility lib → scan (fail closed toward
+# scanning). The push-time scan covers content leaving for another remote.
+if _source_lib "_lib-leak-remote-visibility.sh"; then
+  origin_url=$(leak_remote_url origin)
+  if [ -n "$origin_url" ] && leak_remote_is_confirmed_private "$origin_url"; then
+    exit 0
+  fi
+fi
 
 block() {
   local path="$1"
@@ -100,28 +71,12 @@ MSG
 
 while IFS= read -r -d '' path; do
   [ -n "$path" ] || continue
-  [ "$path" = "$registry_rel" ] && continue
+  [ -n "${PRIVATE_REFS_REGISTRY_REL:-}" ] && [ "$path" = "$PRIVATE_REFS_REGISTRY_REL" ] && continue
   git show ":$path" >/dev/null 2>&1 || continue
 
-  for name in "${names[@]}"; do
-    [ -n "$name" ] || continue
-    [ "$name" = "$current_name" ] && continue
-    escaped=$(escape_regex "$name")
-    staged_blob_matches "$path" "(^|[^[:alnum:]_])${escaped}([^[:alnum:]_]|$)" && block "$path"
-  done
-
-  for repo in "${repos[@]}"; do
-    [ -n "$repo" ] || continue
-    [ "$repo" = "$current_repo" ] && continue
-    escaped=$(escape_regex "$repo")
-    staged_blob_matches "$path" "(^|[^A-Za-z0-9_/-])${escaped}(#[0-9]+)?([^A-Za-z0-9_/-]|$)" && block "$path"
-  done
-
-  for workspace in "${workspaces[@]}"; do
-    [ -n "$workspace" ] || continue
-    escaped=$(escape_regex "$workspace")
-    staged_blob_matches "$path" "(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)" && block "$path"
-  done
+  if private_refs_match_staged_blob "$path"; then
+    block "$path"
+  fi
 done < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
 
 exit 0

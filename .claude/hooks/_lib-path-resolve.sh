@@ -1,6 +1,6 @@
 #!/bin/bash
-# _lib-path-resolve.sh — single shared implementation of the portable
-# "realpath -m without GNU coreutils" helper used across the trust chain.
+# _lib-path-resolve.sh — shared nearest-existing-ancestor path helper used
+# across the trust chain. It does not fully resolve final-component links.
 #
 # Sourced by:
 #   - require-active-ticket.sh (the ticket gate's symlink-safe path check)
@@ -25,13 +25,12 @@
 # function fails EMPTY (echoes nothing). Do not fold the two together;
 # `_portfolio_canonicalize`'s callers rely on its fail-soft behaviour.
 
-# Resolve PATH to its canonical, symlink-free absolute form. Walks up to
-# the nearest EXISTING ancestor, physically resolves it (`pwd -P`, which
-# follows symlinks), then re-appends any not-yet-created tail literally —
-# a tail that doesn't exist yet cannot itself be a symlink. This mirrors
-# `realpath -m` without depending on GNU coreutils (not guaranteed present
-# on macOS/BSD). Echoes the resolved path, or nothing if even "/" can't be
-# stat'd (should not happen for a well-formed absolute path).
+# Resolve directory links in PATH without depending on GNU coreutils.
+# Walk up to the nearest existing ancestor, physically resolve its directory
+# (`pwd -P` follows links), then append the remaining tail literally.
+# A final file symlink or dangling link can remain unresolved. Callers that
+# grant a path-based exemption must check the target for symlinks separately.
+# Echo the resulting path, or nothing if even "/" cannot be stat'd.
 #
 # Why this matters (#883): without resolving symlinks first, a symlink
 # living under $HOME that POINTS INTO a governed tree (e.g.
@@ -75,4 +74,72 @@ _resolve_real_path() {
   else
     printf '%s' "$dir"
   fi
+}
+
+# Map a Windows drive-letter path to one POSIX form.
+# C:/Users/a b/repo and C:\Users\a b\repo both become /c/Users/a b/repo
+# when cygpath is absent.
+# A POSIX path is unchanged. A drive-relative path such as C:foo is unchanged.
+# It is not absolute.
+#
+# Git Bash mounts C:/Users/<user>/AppData/Local/Temp at /tmp.
+# pwd -P prints /tmp for that directory.
+# The string transform prints /c/Users/.../Temp.
+# Those two strings are one directory (me2resh/apexyard#1743).
+# When cygpath is on PATH, a drive-letter path uses `cygpath -u --`.
+# The function keeps that output when it is not empty and starts with /.
+# When that directory exists, the function resolves it with pwd -P.
+# Use the string transform when cygpath is absent.
+# Use it when cygpath exits non-zero, prints nothing, or prints a path that
+# does not start with /. That fallback does not call pwd -P.
+# The function does not call cygpath for a path that already starts with /.
+# Linux and macOS do not ship cygpath. Those hosts keep the string transform.
+# The same string rule is in _portfolio_canonicalize (me2resh/apexyard#1018).
+_windows_path_to_posix() {
+  local p="$1" drive rest converted="" phys=""
+  [ -n "$p" ] || return 0
+  case "$p" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        converted=$(cygpath -u -- "$p" 2>/dev/null) || converted=""
+        case "$converted" in
+          /*)
+            if [ -d "$converted" ]; then
+              phys=$(cd "$converted" 2>/dev/null && pwd -P) || phys=""
+              if [ -n "$phys" ]; then
+                converted="$phys"
+              fi
+            fi
+            printf '%s' "$converted"
+            return 0
+            ;;
+        esac
+      fi
+      drive="${p%%:*}"
+      rest="${p#*:}"
+      rest="$(printf '%s' "$rest" | tr '\\' '/')"
+      drive="$(printf '%s' "$drive" | tr '[:upper:]' '[:lower:]')"
+      printf '/%s%s' "$drive" "$rest"
+      ;;
+    *)
+      printf '%s' "$p"
+      ;;
+  esac
+}
+
+# Return 0 when CANDIDATE is ROOT or a path under ROOT.
+# Both sides pass through _windows_path_to_posix first.
+# An empty side is not contained.
+# A failed conversion that leaves the /c/Users/.../Temp form does not match
+# a pwd -P result under /tmp. The check rejects that pair.
+# This rejects a prefix trick such as /repo-evil under /repo.
+path_is_under_root() {
+  local root="$1" candidate="$2"
+  root=$(_windows_path_to_posix "$root")
+  candidate=$(_windows_path_to_posix "$candidate")
+  [ -n "$root" ] && [ -n "$candidate" ] || return 1
+  case "$candidate" in
+    "$root"|"$root"/*) return 0 ;;
+  esac
+  return 1
 }

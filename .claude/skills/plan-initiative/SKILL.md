@@ -77,6 +77,11 @@ Both directories are created on first write if missing.
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 1. Resolve the slug + check for an existing initiative doc
 
 Kebab-ify the argument (lowercase, hyphen-separated, alphanumeric only, max 60 chars). Confirm if the operator passed a non-kebab form.
@@ -148,6 +153,9 @@ Avoid output measures ("ship 10 features"). Prefer outcome measures
 ```
 
 **d) Scope**
+
+Use `AskUserQuestion` for the scope choice. Recommend the specific project when one is named.
+Otherwise recommend framework-wide scope. Use the prompt below only without the tool.
 
 ```
 Is this initiative scoped to:
@@ -265,7 +273,7 @@ if len(sorted_order) < len(milestones):
     # FAIL — print cycle, ask operator to resolve
 ```
 
-On cycle:
+On cycle, use `AskUserQuestion` for the three resolution types. Use the prompt below only without the tool:
 
 ```
 ⚠ Dependency cycle detected:
@@ -397,19 +405,13 @@ Accept:
 Write the active-issue-skill marker as a defensive measure (per AgDR-0030). Note: since #709/#771 issue creation dispatches through the `tracker_create` **function**, invoked via command substitution — `result="$(tracker_create …)"` — which `require-skill-for-issue-create.sh` does not fire on (its matcher only anchors patterns at a command boundary, and a call wrapped in `$(…)` isn't one). So the marker is no longer the mechanism that permits the create; it's kept as a forward-compatible backstop — for robustness, and for any path that still shells out to a bare `gh issue create` at a command boundary:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "plan-initiative" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "plan-initiative" > "$skill_marker"
 ```
 
 For each accepted milestone (in topo-sorted order, so blocking milestones are filed before blocked ones), build the Feature-shape body conforming to `validate-issue-structure.sh`'s required sections:
@@ -516,7 +518,10 @@ On any pass-2 failure: surface the error, name the affected milestone, continue 
 #### Remove the active-issue-skill marker on completion
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
 Always remove on every exit path (success, abort, error). The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers if the skill is interrupted, but a clean exit should never leave one behind.
@@ -561,7 +566,7 @@ Next:
 8. **Idempotence via filed-marker presence.** Re-runs partition milestones into "already filed" (silently skipped at filing step) vs "unfiled" (offered). Step 6's regeneration MUST preserve prior `Filed as [#N](url)` markers — match milestones across runs by name (case-insensitive, normalised whitespace). NOT byte-equivalence on the section (which would break under the post-filing rewrite). Same rule as `/handover` Rule 18.
 9. **Two-pass filing handles cross-refs.** Pass 1 files all accepted milestones (no cross-refs yet — issue numbers not yet known). Pass 2 iterates over the filed set, computes per-milestone cross-refs restricted to the also-filed subset, and rewrites each ticket's body via `gh issue edit`. Pass-2 failures don't abort — partial cross-refs are more useful than zero.
 10. **Source-link every filed ticket back to the initiative doc.** Each filed Feature ticket carries a `_Source: /plan-initiative on YYYY-MM-DD — see projects/<name>/initiatives/<slug>.md in the ops fork (...)_` footer in the body. Plain prose path, no markdown link — the initiative doc isn't in the target repo's URL space. Same shape as `/handover` step 7.5's source-link convention.
-11. **Active-issue-skill marker handling (defensive).** Write `plan-initiative` to `<ops_root>/.claude/session/active-issue-skill` before the first `tracker_create` in pass 1; remove on EVERY exit path (success, abort, error). Per AgDR-0030. Since #709/#771 issue creation runs through the `tracker_create` **function** via command substitution (`result="$(tracker_create …)"`), which `require-skill-for-issue-create.sh` doesn't fire on, the marker is a defensive backstop kept for robustness (and any path that still shells out to a bare `gh issue create` at a command boundary), not the mechanism that permits the create.
+11. **Active-issue-skill marker handling (defensive).** Write `plan-initiative` to the path from `active_issue_skill_marker_path` before the first `tracker_create` in pass 1; remove on EVERY exit path (success, abort, error). Per AgDR-0030. Since #709/#771 issue creation runs through the `tracker_create` **function** via command substitution (`result="$(tracker_create …)"`), which `require-skill-for-issue-create.sh` doesn't fire on, the marker is a defensive backstop kept for robustness (and any path that still shells out to a bare `gh issue create` at a command boundary), not the mechanism that permits the create.
 12. **No bootstrap exemption needed.** The skill writes `*.md` (exempt from `require-active-ticket.sh`) and dispatches issue creation through the `tracker_create` **function** via command substitution, which since #709/#771 `require-skill-for-issue-create.sh` doesn't fire on (the active-issue-skill marker written in step 8 pass 1 is kept as a defensive backstop, not the thing that satisfies the gate). Don't add `plan-initiative` to `ticket.bootstrap_skills`.
 13. **Re-run history is append-only.** Each invocation adds one row to the table at the bottom of the doc. Don't truncate; long histories are evidence the initiative is being actively re-planned.
 14. **Out-of-scope items belong in the Anti-scope section.** When the operator names something during the interview as "we considered this but no", capture it in the doc's `## Anti-scope` block. Mirrors `templates/architecture/vision.md` § Anti-scope.

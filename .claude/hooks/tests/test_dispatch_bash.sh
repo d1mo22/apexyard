@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="$ROOT/../settings.json"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# The dispatcher and stub hooks use env bash; pin them to the interpreter
+# running this test so a /bin/bash run really exercises Bash 3.2.
+mkdir -p "$TMP/bin"
+ln -s "$BASH" "$TMP/bin/bash"
+# The merge prefetch (AgDR-0256) calls gh for a merge with a literal repo.
+# A failing stub keeps this test off the network. A failed prefetch only
+# means that the (stub) gates fetch.
+printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
+PATH="$TMP/bin:$PATH"
+export PATH
 
 bash_entries=$(jq '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[]] | length' "$SETTINGS")
 [ "$bash_entries" -eq 1 ]
@@ -15,10 +31,14 @@ reviewer_entries=$(jq '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hook
 
 mkdir -p "$TMP/hooks"
 cp "$ROOT/dispatch-bash.sh" "$TMP/hooks/dispatch-bash.sh"
+cp "$(dirname "$ROOT/dispatch-bash.sh")/_lib-awk-fallback.sh" "$TMP/hooks/_lib-awk-fallback.sh"
 cp "$ROOT/_lib-extract-pr.sh" "$TMP/hooks/_lib-extract-pr.sh"
+cp "$ROOT/_lib-command-scrub.sh" "$TMP/hooks/_lib-command-scrub.sh"
+cp "$ROOT/_lib-git-global.sh" "$TMP/hooks/_lib-git-global.sh"
+cp "$ROOT/_lib-strip-heredoc.sh" "$TMP/hooks/_lib-strip-heredoc.sh"
 chmod +x "$TMP/hooks/dispatch-bash.sh"
 
-scripts='block-ambient-tracker-repo.sh block-privileged-escalation.sh require-skill-for-issue-create.sh require-migration-ticket.sh require-active-ticket.sh suggest-mcp-search.sh warn-review-marker-write.sh warn-isolated-build-risk.sh block-reviewer-repo-mutation.sh block-git-add-all.sh block-main-push.sh validate-branch-name.sh pre-push-gate.sh block-agent-routing-drift.sh check-secrets.sh block-onboarding-in-git.sh verify-commit-refs.sh validate-commit-format.sh require-agdr-for-arch-changes.sh warn-bootstrap-scope.sh suggest-ticket-template.sh validate-issue-structure.sh block-private-refs-in-public-repos.sh validate-pr-create.sh require-agdr-for-arch-pr.sh nudge-control-adversarial-test.sh block-unreviewed-merge.sh require-design-review-for-ui.sh block-merge-on-red-ci.sh require-architecture-review.sh detect-role-trigger.sh'
+scripts='block-protected-target-writes.sh block-ambient-tracker-repo.sh block-privileged-escalation.sh require-skill-for-issue-create.sh require-orbit-slice-for-ticket.sh require-migration-ticket.sh require-active-ticket.sh warn-review-marker-write.sh warn-isolated-build-risk.sh block-reviewer-repo-mutation.sh block-reviewer-ci-wait.sh block-forged-menu-approval.sh block-git-add-all.sh block-main-push.sh validate-branch-name.sh pre-push-gate.sh block-agent-routing-drift.sh check-secrets.sh block-onboarding-in-git.sh verify-commit-refs.sh validate-commit-format.sh require-agdr-for-arch-changes.sh warn-bootstrap-scope.sh suggest-ticket-template.sh validate-issue-structure.sh block-private-refs-in-public-repos.sh validate-pr-create.sh require-agdr-for-arch-pr.sh nudge-control-adversarial-test.sh block-unreviewed-merge.sh require-design-review-for-ui.sh block-merge-on-red-ci.sh require-architecture-review.sh detect-role-trigger.sh'
 for script in $scripts; do
   cat > "$TMP/hooks/$script" <<'EOF'
 #!/usr/bin/env bash
@@ -42,12 +62,62 @@ run() {
     | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh"
 }
 
+payload=$(jq -nc --arg c './.claude/hooks/record-menu-approval.sh' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'bash ".claude/hooks/record-menu-approval.sh"' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'sh '"'"'.claude/hooks/record-menu-approval.sh'"'"'' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'source .claude/hooks/_lib-menu-approval.sh && menu_approval_write_record x y z' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c '. ".claude/hooks/_lib-menu-approval.sh"' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'printf fake-json | .claude/hooks/record-menu-approval.sh' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'exec /some/path/record-menu-approval.sh' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'env bash /some/path/record-menu-approval.sh' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+payload=$(jq -nc --arg c 'menu_approval_write_record x y z' '{tool_name:"Bash", tool_input:{command:$c}}')
+rc=0
+printf '%s' "$payload" | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ]
+
 run true
 grep -qx 'block-ambient-tracker-repo.sh' "$TMP/log"
 grep -qx 'block-reviewer-repo-mutation.sh' "$TMP/log"
+grep -qx 'require-orbit-slice-for-ticket.sh' "$TMP/log"
 if grep -q 'block-unreviewed-merge.sh' "$TMP/log"; then
   exit 1
 fi
+
+# PR-create text in data must not route any PR-create hook.
+for command in "printf '%s' 'gh pr create --title x'" \
+  "$(printf "cat <<'TEXT'\ngh pr create --title x\nTEXT")"; do
+  : > "$TMP/log"
+  jq -nc --arg c "$command" '{tool_name:"Bash",tool_input:{command:$c}}' \
+    | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh"
+  if grep -q '^validate-pr-create.sh$' "$TMP/log"; then
+    echo "FAIL: dispatcher routed quoted PR-create data" >&2
+    exit 1
+  fi
+done
 
 : > "$TMP/log"
 run 'gh pr merge 42'
@@ -162,6 +232,111 @@ done
 cp "$TMP/hooks/block-unreviewed-merge.sh.orig" "$TMP/hooks/block-unreviewed-merge.sh"
 rm -f "$TMP/hooks/block-unreviewed-merge.sh.orig"
 
+# me2resh/apexyard#1623: ticket-first (require-active-ticket.sh) fails CLOSED
+# inside the dispatcher, through the same path as the merge gates. A crash
+# must block (exit 2 plus a BLOCKED line), where run_hook used to WARN and
+# let the Bash call through. block-reviewer-ci-wait.sh is the explicit
+# fail-OPEN exception: it is a cost guard (me2resh/apexyard#1625), so the
+# same crashes must warn and let the call through, and its own exit 2 must
+# still block. Each scenario replaces one stub and restores it afterwards.
+write_crash_stub() {
+  # $1 = stub path, $2 = scenario
+  case "$2" in
+    exit-1)
+      printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n' > "$1" ;;
+    exit-127)
+      printf '#!/usr/bin/env bash\ncat >/dev/null\nthis-command-does-not-exist-anywhere\n' > "$1" ;;
+    syntax-error)
+      printf '#!/usr/bin/env bash\ncat >/dev/null\nif [ 1 -eq 1\n' > "$1" ;;
+    killed-by-signal)
+      printf '#!/usr/bin/env bash\ncat >/dev/null\nkill -TERM $$\n' > "$1" ;;
+  esac
+  chmod +x "$1"
+}
+
+for scenario in exit-1 exit-127 syntax-error killed-by-signal; do
+  # Ticket-first crash -> BLOCKED, exit 2. Use a plain command so no other
+  # route runs.
+  cp "$TMP/hooks/require-active-ticket.sh" "$TMP/hooks/require-active-ticket.sh.orig"
+  write_crash_stub "$TMP/hooks/require-active-ticket.sh" "$scenario"
+  : > "$TMP/log"
+  set +e
+  printf '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
+    | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>"$TMP/stderr"
+  rc=$?
+  set -e
+  cp "$TMP/hooks/require-active-ticket.sh.orig" "$TMP/hooks/require-active-ticket.sh"
+  rm -f "$TMP/hooks/require-active-ticket.sh.orig"
+  if [ "$rc" -ne 2 ]; then
+    echo "FAIL: require-active-ticket.sh ($scenario) did not block (rc=$rc, want 2)" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+  fi
+  # A bash syntax error already exits 2 by itself, with no BLOCKED line.
+  if [ "$scenario" != syntax-error ] && ! grep -q 'BLOCKED: require-active-ticket.sh' "$TMP/stderr"; then
+    echo "FAIL: require-active-ticket.sh ($scenario) blocked without a BLOCKED line naming it" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+  fi
+
+  # Cost guard crash -> WARN, exit 0, and the remaining gates still run.
+  # Bash ends a script with a syntax error at exit 2, the blocking code. The
+  # dispatcher cannot tell that from a deliberate block, so it is not a
+  # fail-open scenario.
+  if [ "$scenario" = syntax-error ]; then
+    continue
+  fi
+  cp "$TMP/hooks/block-reviewer-ci-wait.sh" "$TMP/hooks/block-reviewer-ci-wait.sh.orig"
+  write_crash_stub "$TMP/hooks/block-reviewer-ci-wait.sh" "$scenario"
+  : > "$TMP/log"
+  set +e
+  printf '{"tool_name":"Bash","tool_input":{"command":"git add foo"}}' \
+    | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>"$TMP/stderr"
+  rc=$?
+  set -e
+  cp "$TMP/hooks/block-reviewer-ci-wait.sh.orig" "$TMP/hooks/block-reviewer-ci-wait.sh"
+  rm -f "$TMP/hooks/block-reviewer-ci-wait.sh.orig"
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: block-reviewer-ci-wait.sh ($scenario) must fail OPEN (rc=$rc, want 0)" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+  fi
+  if ! grep -q 'WARN: block-reviewer-ci-wait.sh exited' "$TMP/stderr"; then
+    echo "FAIL: block-reviewer-ci-wait.sh ($scenario) crashed without a WARN line" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+  fi
+  if grep -q 'BLOCKED' "$TMP/stderr"; then
+    echo "FAIL: block-reviewer-ci-wait.sh ($scenario) must not print BLOCKED" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+  fi
+  grep -qx 'block-git-add-all.sh' "$TMP/log"
+done
+
+# A deliberate exit 2 still blocks from both hooks.
+for gate in require-active-ticket.sh block-reviewer-ci-wait.sh; do
+  cp "$TMP/hooks/$gate" "$TMP/hooks/$gate.orig"
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 2\n' > "$TMP/hooks/$gate"
+  chmod +x "$TMP/hooks/$gate"
+  set +e
+  printf '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
+    | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1
+  rc=$?
+  set -e
+  cp "$TMP/hooks/$gate.orig" "$TMP/hooks/$gate"
+  rm -f "$TMP/hooks/$gate.orig"
+  if [ "$rc" -ne 2 ]; then
+    echo "FAIL: $gate exit 2 did not block (rc=$rc, want 2)" >&2
+    exit 1
+  fi
+done
+
+# A passing ticket-first gate lets the call through.
+: > "$TMP/log"
+run 'echo hello'
+grep -qx 'require-active-ticket.sh' "$TMP/log"
+
 for command in \
   'gh pr merge 42' \
   'gh api repos/example/pulls/42' \
@@ -197,6 +372,227 @@ run "git add foo && tracker_pr_merge acme/app 42 squash true"
 : > "$TMP/log"
 run "git commit -m fix tracker_pr_merge wrapper"
 [ "$(grep -c '^block-unreviewed-merge.sh$' "$TMP/log")" -eq 1 ]
+
+# me2resh/apexyard#1527: the case arms match only a command that STARTS with
+# `git push` / `git commit`. A push or commit later in the command must still
+# route its gates, and each gate group must run exactly once.
+run_json() {
+  jq -nc --arg c "$1" '{tool_name:"Bash",tool_input:{command:$c}}' \
+    | DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh"
+}
+
+# broad-space retains older routing, even where Bash removes the pair.
+# Prefix routing cannot see these later verbs, so this exercises the join.
+for command in $'echo ok; git\\\npush' $"echo 'git"$'\\\n'$"push'"; do
+  : > "$TMP/log"
+  run_json "$command"
+  [ "$(grep -c '^block-main-push.sh$' "$TMP/log")" -eq 1 ]
+done
+for command in $'echo ok; git\\\ncommit' $'echo # git\\\ncommit'; do
+  : > "$TMP/log"
+  run_json "$command"
+  [ "$(grep -c '^validate-commit-format.sh$' "$TMP/log")" -eq 1 ]
+done
+
+# A failed or unavailable awk must route both gate groups. Construct the
+# subcommand at runtime so this test does not submit one to live hooks.
+mkdir -p "$TMP/failed-awk"
+cat > "$TMP/failed-awk/awk" <<'EOF'
+#!/usr/bin/env bash
+exit "${FAKE_AWK_EXIT:?}"
+EOF
+chmod +x "$TMP/failed-awk/awk"
+for awk_exit in 1 127; do
+  for scenario in continued-push continued-commit compound-push unrelated; do
+    : > "$TMP/log"
+    case "$scenario" in
+      continued-push)
+        w=push
+        command=$(printf 'git \\\n%s origin x' "$w")
+        ;;
+      continued-commit)
+        w=commit
+        command=$(printf 'git -C /r \\\n  %s -m x' "$w")
+        ;;
+      compound-push)
+        w=push
+        command=$(printf 'cd x && git \\\n %s' "$w")
+        ;;
+      unrelated)
+        command='ls'
+        ;;
+    esac
+    set +e
+    jq -nc --arg c "$command" '{tool_name:"Bash",tool_input:{command:$c}}' \
+      | PATH="$TMP/failed-awk:$PATH" FAKE_AWK_EXIT="$awk_exit" \
+        DISPATCH_LOG="$TMP/log" "$TMP/hooks/dispatch-bash.sh" > "$TMP/awk-out" 2> "$TMP/awk-err"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] \
+      || [ "$(grep -c '^block-main-push.sh$' "$TMP/log")" -ne 1 ] \
+      || [ "$(grep -c '^check-secrets.sh$' "$TMP/log")" -ne 1 ]; then
+      echo "FAIL: awk exit $awk_exit did not route both gates for $scenario (dispatcher rc=$rc)" >&2
+      cat "$TMP/awk-err" >&2
+      cat "$TMP/log" >&2
+      exit 1
+    fi
+  done
+done
+
+# A working join must leave unrelated commands outside both gate groups.
+: > "$TMP/log"
+run_json ls
+if grep -qE '^(block-main-push|check-secrets)\.sh$' "$TMP/log"; then
+  echo 'FAIL: working awk routed ls to push or commit gates' >&2
+  cat "$TMP/log" >&2
+  exit 1
+fi
+
+# The stock macOS Bash 3.2 substitution used to exceed the hook timeout on
+# 3,000 continued lines. SIGTERM is deferred inside that substitution, so a
+# watchdog must use SIGKILL. Run the real dispatcher with the stub gates.
+awk 'BEGIN { for (i = 0; i < 3000; i++) printf "echo x\\\n"; printf "true" }' \
+  | jq -Rs '{tool_name:"Bash",tool_input:{command:.}}' > "$TMP/long-command.json"
+continued_lines=$(jq -r '.tool_input.command' "$TMP/long-command.json" | awk '/\\$/ { n++ } END { print n+0 }')
+[ "$continued_lines" -eq 3000 ]
+: > "$TMP/log"
+rm -f "$TMP/dispatch-timeout"
+start_time=$(date +%s)
+# Run the dispatcher under /bin/bash explicitly. Its `env bash` shebang picks
+# the first bash on PATH, which is bash 5 on machines with Homebrew bash, and
+# then this check would never exercise the stock macOS 3.2 interpreter.
+dispatch_bash=/bin/bash
+[ -x "$dispatch_bash" ] || dispatch_bash=bash
+DISPATCH_LOG="$TMP/log" "$dispatch_bash" "$TMP/hooks/dispatch-bash.sh" \
+  < "$TMP/long-command.json" > "$TMP/dispatch-out" 2> "$TMP/dispatch-err" &
+dispatch_pid=$!
+(
+  sleep 10 &
+  watchdog_sleep_pid=$!
+  trap 'kill "$watchdog_sleep_pid" 2>/dev/null || true; exit 0' TERM
+  wait "$watchdog_sleep_pid" || exit 0
+  if kill -0 "$dispatch_pid" 2>/dev/null; then
+    : > "$TMP/dispatch-timeout"
+    kill -KILL "$dispatch_pid" 2>/dev/null || true
+  fi
+) &
+watchdog_pid=$!
+set +e
+wait "$dispatch_pid"
+dispatch_rc=$?
+set -e
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+elapsed=$(( $(date +%s) - start_time ))
+if [ -e "$TMP/dispatch-timeout" ] || [ "$dispatch_rc" -ne 0 ] || [ "$elapsed" -gt 10 ]; then
+  echo "FAIL: 3,000-line dispatcher took ${elapsed}s (rc=$dispatch_rc; limit 10s)" >&2
+  cat "$TMP/dispatch-err" >&2
+  exit 1
+fi
+echo "PASS: 3,000-line dispatcher took ${elapsed}s under $("$dispatch_bash" -c 'echo "$BASH_VERSION"')"
+
+for command in \
+  'git push origin main' \
+  'cd /some/repo && git push origin main' \
+  'cd /some/repo; git push origin main' \
+  'cd /some/repo&&git push origin main' \
+  'git fetch && git push' \
+  'git push; echo done' \
+  'git push&& echo done' \
+  '(git push origin main)' \
+  'git -C /some/repo push origin main' \
+  'git -C "/some dir/repo" push origin main' \
+  "git -C '/some dir/repo' push origin main" \
+  'git -c push.default=current push' \
+  'git --no-pager push origin main' \
+  'git --git-dir=/some/repo/.git push origin main' \
+  'git --git-dir /some/repo/.git push origin main' \
+  'git --work-tree /some/repo push origin main' \
+  'git --namespace ns push origin main' \
+  "$(printf 'git \\\n  push origin main')" \
+  '/usr/bin/git push origin main'; do
+  : > "$TMP/log"
+  run_json "$command"
+  for gate in block-main-push.sh validate-branch-name.sh pre-push-gate.sh; do
+    if [ "$(grep -c "^${gate}\$" "$TMP/log")" -ne 1 ]; then
+      echo "FAIL: '$command' did not run $gate exactly once" >&2
+      cat "$TMP/log" >&2
+      exit 1
+    fi
+  done
+  if grep -q '^check-secrets.sh$' "$TMP/log"; then
+    echo "FAIL: '$command' routed the commit gates" >&2
+    exit 1
+  fi
+done
+
+for command in \
+  'git commit -m "fix: x"' \
+  'cd /some/repo && git commit -m "fix: x"' \
+  'git add foo; git commit -m "fix: x"' \
+  'git -C /some/repo commit -m "fix: x"' \
+  'git -c user.name=x commit -m "fix: x"' \
+  'git --work-tree /some/repo commit -m "fix: x"' \
+  'git --git-dir /some/repo/.git commit -m "fix: x"'; do
+  : > "$TMP/log"
+  run_json "$command"
+  for gate in check-secrets.sh validate-commit-format.sh warn-bootstrap-scope.sh; do
+    if [ "$(grep -c "^${gate}\$" "$TMP/log")" -ne 1 ]; then
+      echo "FAIL: '$command' did not run $gate exactly once" >&2
+      cat "$TMP/log" >&2
+      exit 1
+    fi
+  done
+  if grep -q '^block-main-push.sh$' "$TMP/log"; then
+    echo "FAIL: '$command' routed the push gates" >&2
+    exit 1
+  fi
+done
+
+# A commit then a push in one command routes both groups, each once.
+: > "$TMP/log"
+run_json 'cd /some/repo && git commit -m "fix: x" && git push origin main'
+[ "$(grep -c '^block-main-push.sh$' "$TMP/log")" -eq 1 ]
+[ "$(grep -c '^check-secrets.sh$' "$TMP/log")" -eq 1 ]
+# block-agent-routing-drift.sh sits in both groups, so it runs once per group.
+[ "$(grep -c '^block-agent-routing-drift.sh$' "$TMP/log")" -eq 2 ]
+
+# The scan matches the git subcommand, not any word that contains it.
+for command in \
+  'git stash push -m wip' \
+  'git log --oneline push' \
+  'git push-helper origin' \
+  'echo gitpush' \
+  'mygit push origin main' \
+  'git commitment' \
+  'git show --stat HEAD'; do
+  : > "$TMP/log"
+  run_json "$command"
+  if grep -qE '^(block-main-push|check-secrets)\.sh$' "$TMP/log"; then
+    echo "FAIL: '$command' routed push or commit gates" >&2
+    cat "$TMP/log" >&2
+    exit 1
+  fi
+done
+
+# The scan does not scrub quoted data. Text that only mentions a push still
+# routes the push gates. Pin that over-match so a later change does not
+# scrub the input and lose `sh -c '...'` routing with it.
+: > "$TMP/log"
+run_json "echo 'run git push later' > notes.txt"
+[ "$(grep -c '^block-main-push.sh$' "$TMP/log")" -eq 1 ]
+: > "$TMP/log"
+run_json "sh -c 'git push origin main'"
+[ "$(grep -c '^block-main-push.sh$' "$TMP/log")" -eq 1 ]
+
+# A blocking push gate still blocks when only the scan reaches it.
+: > "$TMP/log"
+set +e
+printf '%s' "$(jq -nc --arg c 'cd /some/repo && git push origin main' '{tool_name:"Bash",tool_input:{command:$c}}')" \
+  | DISPATCH_LOG="$TMP/log" DISPATCH_FAIL_SCRIPT=block-main-push.sh DISPATCH_FAIL_EXIT=2 "$TMP/hooks/dispatch-bash.sh" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ]
 
 : > "$TMP/log"
 set +e
@@ -282,9 +678,12 @@ if ! grep -q '_lib-extract-pr.sh' "$TMP/stderr"; then
   exit 1
 fi
 
-# Control: a MISSING (not unreadable) library must stay a tolerated
-# partial-install case, not a new block — this test would also catch an
-# overly broad fix that blocks on absence too.
+# Control: a MISSING (not unreadable) library must not make the dispatcher
+# itself invent a new absence block on top of the merge-gate path. This
+# sandbox uses stub merge gates that always exit 0, so the dispatcher's
+# fail-closed "run the merge gates" path still returns 0 here. In a real
+# install the same missing file makes each gate's `_require_lib` block
+# every Bash command (AgDR-0169 Consequences). That is not a no-op.
 cp -r "$TMP/hooks" "$missing_lib_dir/hooks"
 rm -f "$missing_lib_dir/hooks/_lib-extract-pr.sh"
 
@@ -294,7 +693,7 @@ printf '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
 rc=$?
 set -e
 if [ "$rc" -eq 2 ]; then
-  echo "FAIL: a MISSING (not unreadable) _lib-extract-pr.sh should not itself block a non-merge command" >&2
+  echo "FAIL: with stub merge gates, a MISSING _lib-extract-pr.sh must not make the dispatcher invent its own absence block" >&2
   cat "$TMP/stderr" >&2
   exit 1
 fi

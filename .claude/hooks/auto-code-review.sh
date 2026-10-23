@@ -32,28 +32,15 @@
 # Whichever one is reading it follows its own branch; the other branch is a
 # no-op for that reader.
 #
-# The orchestrator branch also tells the caller to set the active-reviewer
-# session marker (resolved through active_reviewer_marker_path in
-# _lib-review-markers.sh — session-scoped since #1376, never the literal
-# .claude/session/active-reviewer string) before spawning Rex.
-# #843 made warn-review-marker-write.sh refuse that write without the marker;
-# #1026 returned it to ADVISORY (it warns, never blocks — see AgDR-0111,
-# which supersedes AgDR-0109's block-on-resolved-target decision), so
-# the marker now suppresses a spurious warning rather than unblocking a write.
-# Set it anyway: the convention is what keeps a real review distinguishable
-# from an author reviewing their own work, and the merge gate is what enforces.
+# The banner uses one short line, capped at 300 bytes. It tells the
+# orchestrator to wait for CI, then run /code-review. Sub-agents report
+# the PR to the orchestrator. It gives no marker instructions or tier note.
 #
-# TIER-AWARE NOTE (me2resh/apexyard#1064, AgDR-0116): the banner below keeps
-# "Rex runs on every PR" completely unconditional — that instruction is
-# NEVER softened by tier, because block-unreviewed-merge.sh requires the Rex
-# marker regardless of tier and is not touched by this change. What IS
-# tier-conditional, per .claude/rules/right-size-ceremony.md, is the ROLE
-# CHAIN around Rex (Security Auditor / Solution Architect / UI Designer) —
-# those already only fire on their own diff/path triggers. Do not read the
-# tier note below as license to skip Rex on a Lean diff; it only ever
-# changes Rex's OWN review depth (reduced-scope, per
-# .claude/agents/code-reviewer.md § "Reduced-Scope Review"), never whether
-# Rex runs.
+# TIER-AWARE NOTE (me2resh/apexyard#1064, AgDR-0116): this header keeps
+# "Rex runs on every PR" completely unconditional. The merge gate requires
+# Rex approval for every tier. The tier-aware role chain includes the
+# Security Auditor, Solution Architect, and UI Designer when their triggers apply.
+# The review rules set Rex's depth. The banner does not describe those rules.
 
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
@@ -69,7 +56,14 @@ if [ "$TOOL_NAME" != "Bash" ] || [ -z "$COMMAND" ]; then
 fi
 
 # Only fire on gh pr create
-if ! echo "$COMMAND" | grep -qE '\bgh\s+pr\s+create\b'; then
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCAN_COMMAND="$COMMAND"
+if [ -r "$HOOKS_DIR/_lib-command-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOKS_DIR/_lib-command-scrub.sh"
+  SCAN_COMMAND=$(scrub_bash_command "$COMMAND")
+fi
+if ! echo "$SCAN_COMMAND" | grep -qE '\bgh\s+pr\s+create\b'; then
   exit 0
 fi
 
@@ -84,7 +78,6 @@ else
 fi
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "${REPO_ROOT:-.}/.claude/session/pending-reviews"
 if [ -n "$PR_NUMBER" ]; then
   echo "${PR_URL}" > "${REPO_ROOT:-.}/.claude/session/pending-reviews/${PR_NUMBER}"
@@ -100,74 +93,30 @@ if [ -n "$PR_NUMBER" ]; then
   fi
 fi
 
-cat >&2 <<MSG
-AUTO CODE REVIEW REQUIRED
-
-${PR_REF} was just created. ApexYard requires the code-reviewer agent (Rex)
-to run on every PR before it can be merged — see workflows/code-review.md
-and .claude/rules/pr-workflow.md. This message is read by TWO possible
-audiences; follow only the branch that applies to you.
-
---------------------------------------------------------------------------
-IF YOU ARE A BUILD-CLASS SUB-AGENT (backend-engineer, frontend-engineer,
-platform-engineer, product-manager, data-engineer, ui-designer, ux-designer,
-tech-lead, etc.) — spawned to implement a ticket, running in your own
-isolated context:
-
-  You CANNOT nest the Agent tool, so you cannot spawn Rex yourself. Do NOT
-  attempt to review this PR, do NOT post a review comment, and do NOT write
-  ANY file under .claude/session/reviews/ (including *-rex.approved).
-  Nothing will mechanically stop you: warn-review-marker-write.sh only
-  WARNS (advisory since #1026 — AgDR-0111). That is precisely why this
-  instruction matters. Writing that file would record a review that never
-  happened, and the human approving the merge would be relying on it.
-  Report the PR back to the orchestrator
-  plainly ("PR ${PR_REF} created: ${PR_URL}") and stop. The orchestrator
-  runs the real, independent Rex review after you hand back.
---------------------------------------------------------------------------
-IF YOU ARE THE ORCHESTRATOR (this is your own \`gh pr create\`, or a
-build sub-agent just handed this PR back to you):
-
-  Run the code review through the /code-review skill on ${PR_REF}:
-
-       /code-review ${PR_NUMBER:-<pr>}
-
-  The skill sets the active-reviewer session marker, spawns Rex, and
-  clears the marker for you — you should NOT set that marker by hand.
-  Use the skill rather than spawning the code-reviewer agent directly:
-  it is what makes the review a separate, sanctioned pass instead of the
-  author grading their own work. (The marker also suppresses an advisory
-  warning on Rex's own marker write, but that is a side effect, not the
-  reason — the hook warns and never blocks since #1026.)
-
-  ONE EXCEPTION, and only for you (me2resh/apexyard#1161). After the review
-  returns, confirm the approval marker exists. If the review ran "in the
-  background" and posted nothing to the PR, the harness ran its OWN bundled
-  /code-review instead of ApexYard's skill. That bundled skill knows nothing
-  about these markers, so re-running it cannot help. Only in that case: set
-  the active-reviewer marker yourself, then spawn the code-reviewer agent
-  (Rex) directly with the Agent tool. A CHANGES REQUESTED verdict is NOT this
-  case — a real review that requests changes writes no approval marker by
-  design, and the fix is to address the findings. Never write the approval
-  marker yourself in either case.
---------------------------------------------------------------------------
-
-CEREMONY TIER (.claude/rules/right-size-ceremony.md, AgDR-0116): Rex runs on
-EVERY PR, full stop — that instruction above is unconditional and does not
-change by tier. What varies by tier is the ROLE CHAIN layered around Rex
-(Security Auditor / Solution Architect / UI Designer) — those already only
-activate on their own diff/path triggers, never on a self-declared tier. A
-Lean-tier diff (docs / config-text, small, reversible, no behavior change,
-non-security-path) still gets a Rex pass — in REDUCED SCOPE per
-.claude/agents/code-reviewer.md § "Reduced-Scope Review" — never a bypass.
-
-The merge-gate hook will block \`gh pr merge\` for this PR until Rex's approval
-marker exists. Do NOT quote a marker path when you invoke the review — the
-reviewer resolves its own repo-qualified path (me2resh/apexyard#1144); a path
-handed to it in a prompt overrides that and lands the marker where no gate
-reads it.
-
-This message is a reminder from the PostToolUse hook, not a tool error. The PR
-was created successfully.
-MSG
+# Banner budget: 300 bytes at most (me2resh/apexyard#1625, tested by
+# test_auto_code_review_banner.sh). The long text lived here before and cost
+# about 3.9 KB of context on every PR. The rules it carried are in
+# .claude/rules/pr-workflow.md and the /code-review skill. Keep both readers
+# covered (#843): a build agent cannot spawn Rex and must not review.
+# The caller class comes from the harness agent_type (review_caller_class in
+# _lib-review-markers.sh, AgDR-0145 amendment, me2resh/apexyard#1649). A
+# sub-agent gets the stop line and the orchestrator gets the review line.
+# With no class available, print the combined line that serves both readers.
+CALLER_CLASS=unknown
+if [ -r "$HOOKS_DIR/_lib-review-markers.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOKS_DIR/_lib-review-markers.sh"
+  CALLER_CLASS=$(review_caller_class "$INPUT" "")
+fi
+case "$CALLER_CLASS" in
+  reviewer|other-agent|untyped-agent)
+    printf '%s\n' "${PR_REF} created. Report the PR and stop. Never review it or write review markers. The orchestrator runs the review." >&2
+    ;;
+  main)
+    printf '%s\n' "${PR_REF} created. Wait for green CI with a Monitor, then run /code-review ${PR_NUMBER:-<pr>}. Build agents run at the same time." >&2
+    ;;
+  *)
+    printf '%s\n' "${PR_REF} created. Build agent: report the PR and stop; never review it or write review markers. Orchestrator: wait for green CI with a Monitor, then run /code-review ${PR_NUMBER:-<pr>}." >&2
+    ;;
+esac
 exit 2

@@ -12,6 +12,8 @@ category: security
 # Unextractable Bash write target honors only the session ticket
 
 > The ticket-gate hook `require-active-ticket.sh` blocked an unextractable Bash write target, even with an active ticket. I decided to check only the ops-level `current-ticket` marker for that target, skipping the per-worktree and per-project tiers. An active session ticket now gates the write. No new exemption exists. The target still cannot use a per-project or per-worktree marker, because it carries no project to resolve them against.
+>
+> **Amended by AgDR-0222.** The gate first judges an unextractable target against the marker in the git dir of the hook's working tree. Without a trusted marker there, the ops-level `current-ticket` file still answers it, as this AgDR decided. That holds until a breaking release removes the old resolution.
 
 ## Context
 
@@ -38,6 +40,8 @@ restores that earlier behavior. It does not widen the gate.
 | Exempt an unextractable target from the gate entirely | Simplest change | Widens a security gate — any write the detector cannot parse would bypass the ticket requirement, reopening the class of bypass #151 closed |
 | Skip only the per-worktree/per-project tiers, and still check `current-ticket` | Matches the header comment's stated intent. Adds no new exemption. An unextractable target still needs an active session ticket. | The target cannot bind to a project marker. A session with only a per-project marker still blocks an unextractable target. |
 | Block unextractable targets with no fallback at all (status quo) | No behavior change | Contradicts the hook's documented intent. Blocks a session that already declared a ticket. Forces the Edit or Write tool for a valid Bash write. |
+
+> **Note 2026-10-21 ([AgDR-0267](AgDR-0267-shell-text-gates-are-guardrails.md)).** "Security gate" in the first row means a guardrail. The ticket gate reads shell text, so it catches honest mistakes and is not a security boundary.
 
 ## Decision
 

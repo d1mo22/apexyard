@@ -133,6 +133,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Isolation: don't let a live session pin escape this sandbox onto the real
 # ops fork (see bin/run-hook-tests.sh's rationale). No-op when unset/headless.
 export APEXYARD_OPS_DISABLE_PIN=1
@@ -190,6 +195,7 @@ make_sandbox() {
   cp "$HOOK_SRC" "$sb/.claude/hooks/warn-review-marker-write.sh"
   cp "$LIB_OPS_ROOT" "$sb/.claude/hooks/_lib-ops-root.sh"
   cp "$LIB_BDW" "$sb/.claude/hooks/_lib-detect-bash-write.sh"
+  cp "$(dirname "$LIB_BDW")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
   chmod +x "$sb/.claude/hooks/warn-review-marker-write.sh"
   echo "$sb"
 }
@@ -823,6 +829,23 @@ case38() {
 }
 
 # ---------------------------------------------------------------------------
+# (38b) Bash → BSD-form `sed -Ei '' s/aa/bb/ <marker>` -> WARNS, exit 0.
+#       #1414: the library now detects `-i` inside a group of short flags.
+#       This hook's own copy of the sed -i pattern still read only `-i`,
+#       so IS_EXTRACTION_FRAGILE stayed 0. The mis-extracted target
+#       `s/aa/bb/` then looked conclusive, and the hook did not warn.
+# ---------------------------------------------------------------------------
+case38b() {
+  local sb; sb=$(make_sandbox)
+  local marker; marker=$(review_marker_path "$REPO" 42 rex "$sb")
+  printf '%s\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" > "$marker"
+  local cmd="sed -Ei '' s/aa/bb/ ${marker}"
+  run_hook "$sb" "Bash BSD sed -Ei '' mis-extracted target on rex marker -> WARNS (#1414)" \
+    "$(bash_json "$cmd")" 0 "WARNING"
+  rm -rf "$sb"
+}
+
+# ---------------------------------------------------------------------------
 # (39) Bash → GNU-form `sed -i s/aa/bb/ <marker>` on a real rex marker ->
 #      DETECTED -> warns, exit 0. Regression guard: GNU's single-token form returns
 #      EMPTY targets from bash_extract_write_target and already reached the
@@ -1147,6 +1170,7 @@ case35
 case36
 case37
 case38
+case38b
 case39
 case40
 case41
@@ -1157,6 +1181,43 @@ case45
 case46
 case47
 case48
+
+# ---------------------------------------------------------------------------
+# (49-51) me2resh/apexyard#1649: the marker grant depends on the caller type.
+# A typed build agent never gets the grant. A review agent and the
+# orchestrator do, and a per-review marker file counts like the legacy file.
+# ---------------------------------------------------------------------------
+typed_write_json() {
+  jq -nc --arg path "$1" --arg t "$2" \
+    '{tool_name:"Write",tool_input:{file_path:$path,content:"sha123"}} + (if $t != "" then {agent_type:$t,agent_id:"a1"} else {} end)'
+}
+run_typed() { # sandbox label json want(warn|silent)
+  local sb="$1" label="$2" json="$3" want="$4" err rc
+  err=$(cd "$sb" && printf '%s' "$json" | "$sb/.claude/hooks/warn-review-marker-write.sh" 2>&1 >/dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ] && { { [ "$want" = warn ] && [ -n "$err" ]; } || { [ "$want" = silent ] && [ -z "$err" ]; }; }; then
+    echo "PASS [$label]"; PASS=$((PASS+1))
+  else
+    echo "FAIL [$label]: rc=$rc want=$want stderr=${err:0:200}" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="$FAILED_CASES $label"
+  fi
+}
+case49() {
+  local sb; sb=$(make_sandbox)
+  cp "$(dirname "$HOOK_SRC")/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
+  printf '%s\n' "${REPO}#42:rex" > "$sb/.claude/session/active-reviewer"
+  local marker; marker=$(review_marker_path "$REPO" 42 rex "$sb")
+  run_typed "$sb" "typed build agent is denied the marker grant" "$(typed_write_json "$marker" backend-engineer)" warn
+  run_typed "$sb" "typed code-reviewer gets the marker grant" "$(typed_write_json "$marker" code-reviewer)" silent
+  run_typed "$sb" "orchestrator gets the marker grant" "$(typed_write_json "$marker" "")" silent
+  rm -f "$sb/.claude/session/active-reviewer"
+  mkdir -p "$sb/.claude/session/active-reviewers/nosession"
+  printf '%s\n' "${REPO}#42:rex" > "$sb/.claude/session/active-reviewers/nosession/me2resh__apexyard__42-rex"
+  run_typed "$sb" "per-review marker file grants the sanctioned write" "$(typed_write_json "$marker" code-reviewer)" silent
+  run_typed "$sb" "per-review marker file does not grant a build agent" "$(typed_write_json "$marker" platform-engineer)" warn
+  rm -rf "$sb"
+}
+case49
 
 # ---------------------------------------------------------------------------
 # Summary

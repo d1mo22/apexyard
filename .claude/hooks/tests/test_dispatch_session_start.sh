@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="$ROOT/../settings.json"
 DISPATCHER="$ROOT/dispatch-session-start.sh"
@@ -17,7 +22,7 @@ bash_entries=$(jq '[.hooks.SessionStart[].hooks[]] | length' "$SETTINGS")
 dispatcher_command=$(jq -r '[.hooks.SessionStart[].hooks[].command][0]' "$SETTINGS")
 grep -q 'dispatch-session-start.sh' <<<"$dispatcher_command"
 
-scripts='pin-ops-root.sh onboarding-check.sh check-upstream-drift.sh check-jq-installed.sh check-git-hooks-installed.sh check-portfolio-config.sh clear-bootstrap-marker.sh clear-active-reviewer-marker.sh clear-onboarding-depth-mode-marker.sh clear-onboarding-glossary-seen-marker.sh clear-issue-skill-marker.sh link-custom-skills.sh apply-agent-routing.sh remind-mcp-tools.sh validate-search-config.sh print-portfolio-primer.sh reindex-on-session-start.sh warn-unqualified-review-marker.sh'
+scripts='pin-ops-root.sh write-session-snapshot.sh write-rule-excludes.sh onboarding-check.sh check-upstream-drift.sh check-jq-installed.sh check-git-hooks-installed.sh check-portfolio-config.sh clear-bootstrap-marker.sh clear-active-reviewer-marker.sh clear-onboarding-depth-mode-marker.sh clear-onboarding-glossary-seen-marker.sh clear-issue-skill-marker.sh link-custom-skills.sh apply-agent-routing.sh print-portfolio-primer.sh warn-unqualified-review-marker.sh warn-legacy-ticket-markers.sh'
 for script in $scripts; do
   grep -q "APEXYARD_SESSION_START_HOOK: $script" "$DISPATCHER"
 done
@@ -35,7 +40,7 @@ array_list() {
 lists_agree() {
   local file="$1" comments array loops
   comments=$(comment_list "$file")
-  array="pin-ops-root.sh $(array_list "$file")"
+  array="pin-ops-root.sh write-session-snapshot.sh $(array_list "$file")"
   [ "$comments" = "$array" ] || return 1
   # No loop may carry its own literal copy of the list.
   loops=$(grep -cE '^[[:space:]]*for script in .*\.sh' "$file" || true)
@@ -51,7 +56,7 @@ lists_agree "$DISPATCHER" || fail "dispatcher comment list, scripts array, and f
 # The parity check must actually catch drift. Break each source once.
 sed '/^  apply-agent-routing\.sh$/d' "$DISPATCHER" > "$TMP/drift-array.sh"
 if lists_agree "$TMP/drift-array.sh"; then fail "parity check missed a script removed from the array"; fi
-sed '/^# APEXYARD_SESSION_START_HOOK: remind-mcp-tools\.sh$/d' "$DISPATCHER" > "$TMP/drift-comment.sh"
+sed '/^# APEXYARD_SESSION_START_HOOK: print-portfolio-primer\.sh$/d' "$DISPATCHER" > "$TMP/drift-comment.sh"
 if lists_agree "$TMP/drift-comment.sh"; then fail "parity check missed a script removed from the comments"; fi
 # shellcheck disable=SC2016 # literal ${scripts[@]} text, not an expansion
 sed 's|for script in "\${scripts\[@\]}"; do|for script in onboarding-check.sh; do|' "$DISPATCHER" > "$TMP/drift-loop.sh"
@@ -87,6 +92,7 @@ payload='{"hook_event_name":"SessionStart"}'
 assert_all_ran_once() {
   local log="$1" label="$2"
   [ "$(head -1 "$log")" = "pin-ops-root.sh" ] || fail "$label: pin-ops-root.sh did not run first"
+  [ "$(sed -n '2p' "$log")" = "write-session-snapshot.sh" ] || fail "$label: snapshot did not run second"
   for script in $scripts; do
     [ "$(grep -cxF "$script" "$log")" -eq 1 ] || fail "$label: $script did not run exactly once"
   done

@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # Blocks committing a filled-in onboarding.yaml — the Layer-2 backstop for the
 # example-file + gitignore model (#517 / AgDR-0064).
 #
@@ -19,20 +20,35 @@
 #   - env var:    APEXYARD_ALLOW_ONBOARDING_COMMIT=1
 #   - in-message: include  <!-- onboarding: allow -->  in the commit message
 
-INPUT=$(cat)
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
+INPUT="$_GIT_GATE_INPUT"
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR/_lib-git-global.sh"
+fi
 
 if [ -z "$COMMAND" ]; then
   . "$(dirname "$0")/_lib-fail-closed-json.sh"
-  if raw_payload_command_matches "$INPUT" 'git[[:space:]]+commit'; then
+  _onboard_pat='git[[:space:]]+commit'
+  if command -v git_subcommand_payload_pattern >/dev/null 2>&1; then
+    _onboard_pat="$(git_subcommand_payload_pattern commit)"
+  fi
+  if raw_payload_command_matches "$INPUT" "$_onboard_pat"; then
     echo "BLOCKED: onboarding guard cannot parse this commit command. Restore jq and retry." >&2
     exit 2
   fi
   exit 0
 fi
 
-# Only check on git commit
-echo "$COMMAND" | grep -qE '\bgit\s+commit\b' || exit 0
+# Only check on git commit. Global options may sit between git and commit.
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  command_has_git_subcommand "$COMMAND" commit || exit 0
+else
+  echo "$COMMAND" | grep -qE '\bgit\s+commit\b' || exit 0
+fi
 
 # Escape hatches
 if [ "${APEXYARD_ALLOW_ONBOARDING_COMMIT:-}" = "1" ]; then
@@ -44,19 +60,35 @@ if echo "$COMMAND" | grep -q '<!-- onboarding: allow -->'; then
   exit 0
 fi
 
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+PAYLOAD_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null || true)
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  git_prepare_invocation "$COMMAND" commit "$PAYLOAD_CWD"
+fi
+if command -v git_target >/dev/null 2>&1; then
+  REPO_ROOT=$(git_target rev-parse --show-toplevel 2>/dev/null)
+else
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+fi
 [ -z "$REPO_ROOT" ] && exit 0
 
 # Is onboarding.yaml staged for this commit? Use -F (fixed string) so the '.'
 # is a literal dot, not a regex wildcard — '-x' already anchors the whole line.
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+if command -v git_target >/dev/null 2>&1; then
+  STAGED=$(git_target diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+else
+  STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+fi
 echo "$STAGED" | grep -Fxq 'onboarding.yaml' || exit 0
 
 # Placeholder-diff: if the staged onboarding.yaml is byte-identical to the
 # shipped example template, it carries no real values → allow. Otherwise it's
 # a filled-in template → block.
 EXAMPLE="$REPO_ROOT/onboarding.example.yaml"
-STAGED_CONTENT=$(git show ":onboarding.yaml" 2>/dev/null)
+if command -v git_target >/dev/null 2>&1; then
+  STAGED_CONTENT=$(git_target show ":onboarding.yaml" 2>/dev/null)
+else
+  STAGED_CONTENT=$(git show ":onboarding.yaml" 2>/dev/null)
+fi
 if [ -f "$EXAMPLE" ] && [ "$STAGED_CONTENT" = "$(cat "$EXAMPLE")" ]; then
   exit 0
 fi
@@ -87,3 +119,17 @@ Guard source: .claude/hooks/block-onboarding-in-git.sh — sibling to
 check-secrets.sh. Config leaks are worse than the friction of unstaging.
 MSG
 exit 2
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body block "$_GIT_GATE_INPUT" commit
+  exit $?
+fi
+_git_gate_body

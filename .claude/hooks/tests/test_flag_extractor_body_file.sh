@@ -36,6 +36,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 AGDR_HOOK="$REPO_ROOT/.claude/hooks/require-agdr-for-arch-pr.sh"
 PRC_HOOK="$REPO_ROOT/.claude/hooks/validate-pr-create.sh"
@@ -54,18 +59,20 @@ TMPDIR=$(mktemp -d -t flag-extractor.XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # ---------------------------------------------------------------------------
-# Part 1 — the two extractors, driven directly out of the hook source.
+# Part 1 — the two extractors, driven directly.
 #
-# Pulling the functions out rather than invoking the whole hook keeps these
-# cases pinned to the parsing contract itself, independent of the diff
-# inspection and git state the hook otherwise needs.
+# The content parser is sourced from _lib-flag-value.sh. The path parser
+# still lives in the hook. Driving them directly keeps these cases pinned
+# to the parsing contract, independent of the diff inspection and git
+# state the hook otherwise needs.
 #
 # There are TWO extractors on purpose, and the split is the fix:
 #   extract_path_flag  — non-greedy, for --body-file (a path; no quotes in it)
 #   extract_flag_value — greedy, for --title / --body (content; anything in it)
 # ---------------------------------------------------------------------------
 
-eval "$(awk '/^extract_flag_value\(\) \{/,/^\}/' "$AGDR_HOOK")"
+# shellcheck source=/dev/null
+. "$REPO_ROOT/.claude/hooks/_lib-flag-value.sh"
 eval "$(awk '/^extract_path_flag\(\) \{/,/^\}/' "$AGDR_HOOK")"
 
 for fn in extract_flag_value extract_path_flag; do
@@ -193,6 +200,8 @@ make_sandbox() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$PRC_HOOK" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$PRC_HOOK")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
+  cp "$(dirname "$PRC_HOOK")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-read-config.sh" "$sb/.claude/hooks/_lib-read-config.sh"
   [ -f "$SRC_ROOT/.claude/hooks/_lib-tracker.sh" ] && \
@@ -240,6 +249,8 @@ FULL_BODY='## Summary
 | Term | Definition |
 |------|------------|
 | thing | a thing |
+
+Refs #1041
 '
 
 THIN_BODY='## Summary

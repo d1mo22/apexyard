@@ -28,11 +28,11 @@ These four hooks make the SDLC mechanical instead of advisory. Each enforces a r
 
 **Event:** `PreToolUse` on `Edit | Write | MultiEdit`.
 
-**What it does:** blocks edits to any code path unless a session marker exists. Resolution is three-tier (#41 + #513): (0) per-worktree marker at `<ops_root>/.claude/session/tickets/<project>/<safe-branch>` when the edited file's repo is on a git-worktree branch — lets parallel agents on the *same* project hold independent tickets; (1) per-project marker at `<ops_root>/.claude/session/tickets/<project>` (a FILE) when `FILE_PATH` is under `<ops_root>/workspace/<project>/`; (2) fallback `<ops_root>/.claude/session/current-ticket`. Exempts `.claude/`, `docs/`, `projects/*/docs/`, and any `*.md` file so framework / doc / meta work is still fluid.
+**What it does:** blocks edits to any code path unless the working tree holds a ticket marker. Each tree keeps its marker in its own git dir. That is `<repo>/.git/apexyard-ticket`, or `<repo>/.git/worktrees/<id>/apexyard-ticket` for a linked worktree. So parallel sessions on one project never share a ticket. `_lib-active-ticket.sh` finds and validates the git dir with shell builtins and no git process (AgDR-0222). It trusts that marker only for the ops fork and registered clones. A registered clone is `workspace/<project>/` or the `workspace:` path of its registry entry. Symlinks, forged `.git` files and repos owned by another user are not trusted. The one write into a `.git` directory that needs no ticket is the marker and its temporary file. When no trusted marker exists, the hook uses the old-layout markers under `.claude/session/`, with the rules it used before the move. `/start-ticket` still writes them, and a SessionStart notice lists them (AgDR-0222, Backward compatibility). Exempts `.claude/`, `docs/`, `projects/*/docs/`, and any `*.md` file so framework / doc / meta work is still fluid.
 
 **Enforces:** the Pre-Build Gate in `.claude/rules/workflow-gates.md` — "do not start coding until the ticket exists, has acceptance criteria, and is broken into tasks."
 
-**Unblock:** run `/start-ticket <issue>`. The skill verifies the issue via `gh issue view`, resolves the project from the ticket's tracker repo via the portfolio registry, and writes either the per-project or fallback marker.
+**Unblock:** run `/start-ticket <issue>`. The skill verifies the issue via `gh issue view`, and writes the marker into the git dir of the tree you run it in. It also writes the old-layout marker: per-worktree or per-project for a registered repo, else the fallback marker.
 
 ### 1a. Migration ticket-first — `require-migration-ticket.sh`
 
@@ -54,7 +54,9 @@ If any gate fails, blocks with a message pointing at the `/migration` skill. If 
 
 **Event:** `PostToolUse` on `Bash(gh pr create *)`.
 
-**What it does:** parses the PR URL from the `gh` output, writes a pending-review marker at `.claude/session/pending-reviews/<pr>`, and emits a loud reminder telling Claude to invoke the `code-reviewer` agent (Rex) immediately. Not a tool error — the PR is created fine. The hook just pushes the next step into the conversation so it can't be forgotten.
+**What it does:** parses the PR URL from the `gh` output and writes a pending-review marker at `.claude/session/pending-reviews/<pr>`. It then emits a banner of at most 300 bytes (me2resh/apexyard#1625). The banner tells a build agent to report the PR and stop. It tells the orchestrator to wait for green CI with a Monitor, then run `/code-review`. Not a tool error — the PR is created fine. The hook just pushes the next step into the conversation so it can't be forgotten.
+
+Companion control: `block-reviewer-ci-wait.sh` (PreToolUse, through `dispatch-bash.sh`). For review agents only, it blocks `gh pr checks --watch`, `gh run watch`, `sleep` of 60 seconds or more, and a second `gh pr checks` in one review run. It finds a review agent from the `agent_type` field of the hook input. For a sub-agent that has no type, it uses the active-reviewer marker. The orchestrator is never blocked.
 
 **Enforces:** the "After `gh pr create` → Invoke Code Reviewer agent" section of `.claude/rules/pr-workflow.md` and the Code Review phase of `workflows/sdlc.md`.
 
@@ -67,13 +69,13 @@ If any gate fails, blocks with a message pointing at the `/migration` skill. If 
 | Marker | Path (repo-qualified since #485) | Written by | Semantics |
 |--------|----------------------------------|------------|-----------|
 | Rex | `.claude/session/reviews/<owner>__<repo>__<pr>-rex.approved` | `code-reviewer` agent after a successful review | "Code reviewed, no blocking issues" |
-| CEO | `.claude/session/reviews/<owner>__<repo>__<pr>-ceo.approved` | `/approve-merge <pr>` skill, **only** on explicit user invocation | "The human approver has looked at this specific PR and said ship it" |
+| CEO | `.claude/session/reviews/<owner>__<repo>__<pr>-ceo.approved` | `/approve-merge <pr>`, or `record-menu-approval.sh` after a menu answer | "The human approver has looked at this specific PR and said ship it" |
 
 Marker paths are constructed via `_lib-review-markers.sh::review_marker_path <owner/repo> <pr> <role>`. The double-underscore separator ensures the (owner, repo, pr) triple is unambiguous — GitHub slugs never contain `__`. This prevents same-numbered PRs in different managed repos from colliding on the same marker filename (AgDR-0060).
 
-Both files contain exactly one line: the 40-character HEAD SHA at the time of approval. The hook reads each, compares with `git rev-parse HEAD`, and blocks on any mismatch.
+A Rex marker holds one line, the 40-character HEAD SHA. A typed CEO marker is a `skill_version=2` record. A menu record is `skill_version=3` with `approval_channel=menu`. The gate compares the recorded SHA with the PR head. It blocks on a mismatch.
 
-**Why two markers:** The Rex marker alone isn't enough because it would only enforce the "code review happened" half of the 2-reviews rule. The CEO marker is the mechanical enforcement of **"plan-level 'go' is NOT merge approval"** from `.claude/rules/pr-workflow.md`. A plan-level authorization does not produce the CEO marker — only the `/approve-merge` skill does, and the skill is defined to run only on explicit per-PR user invocation. This closes the failure mode where Claude infers merge approval from an umbrella "go" on a broader plan.
+**Why two markers:** The Rex marker alone isn't enough because it would only enforce the "code review happened" half of the 2-reviews rule. The CEO marker is the mechanical enforcement of **"plan-level 'go' is NOT merge approval"** from `.claude/rules/pr-workflow.md`. A plan-level authorization does not produce the CEO marker. The `/approve-merge` skill writes it on an explicit per-PR nod. The menu hook writes it when the operator selects the approve option. This closes the failure mode where Claude infers merge approval from an umbrella "go" on a broader plan.
 
 **Trust model:** the approval files are **local session state**, not a remote trust boundary. They're gitignored and live on the user's machine. Claude can technically `rm` or `touch` them directly, and a malicious local user could forge them too. That's fine — the goal is to prevent Claude (an automated agent in the same session) from merging without the discrete review-and-approve moments, not to protect against an adversary who owns the machine. The failure mode the hook closes is **invisible inference** ("Claude decided 'go' meant 'merge'"); it converts that into **visible rule violation** ("Claude `touch`ed the marker without being asked"). The latter is grep-able and auditable; the former is not.
 
@@ -81,7 +83,25 @@ For adversarial trust, rely on remote branch-protection rules (GitHub required r
 
 **Enforces:** `workflow-gates.md` rule #5 ("2 reviews, CI green, commit SHA matches review") AND `pr-workflow.md` § "Plan-level 'go' is NOT merge approval".
 
-**Companion skill:** `/approve-merge <pr>` (in `.claude/skills/approve-merge/`) is the only supported way to write the CEO marker. The skill definition includes explicit anti-patterns describing the wrong invocation triggers; read it before using.
+**Companion paths:** `/approve-merge <pr>` writes the typed CEO marker. The approval menu is the other path. `record-menu-approval.sh` writes that record. See AgDR-0234.
+
+### 3a. Menu approval — `record-menu-approval.sh`
+
+**Event:** `PostToolUse` on `AskUserQuestion`.
+
+The operator can approve a merge, a design review, or an architecture review from a menu. The question must name the repo, the PR, and the full head SHA. The selected option must be the exact approve label.
+
+The hook reads the harness payload. It writes `approval_channel=menu` and `skill_version=3`. `Not yet` writes nothing. The menu record has the same trust level as a typed marker. The guard is a text-match backstop (AgDR-0104); the real control is the human-only menu answer plus the gate's head-SHA match.
+
+`block-forged-menu-approval.sh` blocks Edit, Write, and Bash writes of that channel onto a marker file. The guard matches text. It is a backstop. See AgDR-0234 and AgDR-0104.
+
+The typed commands stay. A typed merge marker has no menu channel.
+
+### 3b. Reviewer write scope — `limit-reviewer-writes.sh`
+
+**Event:** `PreToolUse` on `Edit|Write|MultiEdit`.
+
+Rex and Hakim have the Write tool for one job: to save the review body that `tracker_review_submit` posts. This hook lets a review agent write only under `<ops-root>/.claude/session/reviews/bodies/`. `review_body_path` in `_lib-review-markers.sh` prints a file name in that folder. The hook blocks every other target of a review agent: repository files, hooks, settings files and review markers. It reads the structured `file_path` field, not shell text. The orchestrator and build agents are not affected. See AgDR-0266 and #1840.
 
 ### 4. Onboarding — `onboarding-check.sh`
 
@@ -196,7 +216,7 @@ design-tokens
 
 **Customize:** `.ui_paths` in `.claude/project-config.json` (REPLACES the default list wholesale — see `docs/project-config.md`). `_lib-ui-paths.sh` filters out a malformed entry (`null`, an object, a nested array, or a whitespace-only string). If every entry is malformed, the library falls back to the shipped defaults above instead of resolving to an empty, always-passing pattern list. Hakim's LOW-2 (me2resh/apexyard#1397) reported this gap.
 
-**Companion skill:** `/approve-design <pr>` (in `.claude/skills/approve-design/`) writes the marker. It follows the same pattern as `/approve-merge`: verify PR state → verify Rex marker at HEAD → write the design marker at the repo root → confirm → stop. The skill definition includes explicit valid/invalid triggers and an anti-pattern section distinguishing mockup approval (design phase) from implementation-review approval (PR phase).
+**Companion paths:** `/approve-design <pr>` writes the typed marker. The menu hook can also write a design record. See AgDR-0234. The typed skill checks the PR state and the Rex marker at HEAD. It then writes the design marker. It stops. The skill definition includes explicit valid and invalid triggers. It also separates mockup approval from review of the PR diff.
 
 **Manual fallback:** for projects that deliberately skip design review (admin tools, internal dashboards), create `touch .claude/session/reviews/<owner>__<repo>__<pr>-design.approved` (using the repo-qualified name) as a visible, auditable "we decided to skip" artifact.
 
@@ -242,6 +262,10 @@ Accepts `type: subject` and `type(scope): subject`. Rejects subjects without a v
 With that config, `wip: scratch work` is accepted and `refactor: cleanup` is rejected. Remove the field or the file to restore the default 11-type list.
 
 **Interactive commits (no `-m` / `-F`)** are skipped — accepted gap, matches sibling hooks' policy.
+
+**Quoted heredoc that writes a file (#1810, AgDR-0263):** the hook removes the body of a quoted heredoc that only feeds `cat` or `tee` to a file before it reads the command. Prose in that body that names a commit, with Markdown backticks, does not start the commit checks. A real commit in the same command is still checked.
+
+**Redirections (#1842, AgDR-0271):** the hook reads the commit words past each redirection, as the shell does, with the redirection reader of `_lib-git-global.sh`. A redirection before the git word, before the verb or among the commit arguments does not hide the message. A redirection alone no longer counts as a compound command, so `git commit -m "fix: x" 2>&1` is checked and passes. A short option group such as `-am <msg>` or `-m<msg>` is read as git reads it. The hook blocks when it cannot read a redirection target, and when `-F -` reads the message from an input redirection.
 
 **Enforces:** `.claude/rules/git-conventions.md § "Commit Message Format"` — was prose-only.
 
@@ -291,6 +315,8 @@ Helpers that implement this convention:
 |--------|---------|----------------|
 | `_lib-extract-pr.sh` | `block-unreviewed-merge.sh`, `require-design-review-for-ui.sh`, `block-merge-on-red-ci.sh` | PR number from `gh pr merge` and `gh api .../pulls/<N>/merge` |
 | `_lib-extract-push-ref.sh` | `validate-branch-name.sh` | Source ref from `git push origin <ref>` (and refspec / -u / --set-upstream / --force-with-lease variants) |
+| `_lib-orbit-records.sh` | `validate-branch-name.sh`, `validate-pr-create.sh` | Validate ORBIT records branch names, simple pushes, and files against remote trunk refs |
+| `_lib-flag-value.sh` | `validate-issue-structure.sh`, `require-agdr-for-arch-pr.sh`, `block-private-refs-in-public-repos.sh`, `require-orbit-slice-for-ticket.sh` | Quoted flag value from a command string. Callers pass the trim and the dash anchor their previous copy used. |
 
 When you add a new hook that depends on git state, ask first: "is the answer
 already in the command string?" If yes, parse it from there. If no, falling
@@ -338,14 +364,11 @@ These were already in place before the enforcement layer and remain unchanged (e
 ```
 .claude/session/
 ├── onboarded                     # created by /onboard, read by onboarding-check
-├── tickets/<project>             # per-project ticket marker (FILE) — #41
-├── tickets/<project>/<branch>    # per-worktree ticket marker — #513 (DIR form; parallel agents)
-├── current-ticket                # created by /start-ticket, read by require-active-ticket (fallback)
 ├── pending-reviews/<pr>          # created by auto-code-review, tracks PRs awaiting Rex
 ├── reviews/<owner>__<repo>__<pr>-rex.approved           # created by code-reviewer agent, read by merge-gate
 ├── reviews/<owner>__<repo>__<pr>-ceo.approved           # created by /approve-merge, read by merge-gate
 ├── reviews/<owner>__<repo>__<pr>-design.approved        # created by /approve-design, read by UI merge-gate
-└── reviews/<owner>__<repo>__<pr>-architecture.approved  # created by /approve-architecture or Tariq
+└── reviews/<owner>__<repo>__<pr>-architecture.approved  # created by /approve-architecture, Tariq, or the menu hook
 ```
 
 If a marker gets stale, delete the file and re-run the corresponding skill.
@@ -386,3 +409,14 @@ All hooks rely on:
 - `gh` for the merge-gate hook's PR-number fallback
 
 On macOS these come from Homebrew (`brew install jq gh`). On Debian-based Linux, `apt install jq gh`. CI runners typically have them pre-installed. If `jq` is missing, the hooks short-circuit cleanly (they can't parse the input, so they exit 0 without blocking) — worth adding a `command -v jq` guard if you want loud failure instead.
+
+### ORBIT records PRs
+
+A ticket-free records PR uses `orbit/<initiative-id>-<description>` and
+`docs(orbit/<initiative-id>): <description>`. The initiative ID is the Plan ID
+without `plan-`. Resolve the longest existing ID prefix from Plan records on
+the branch. Unknown IDs fail closed. The PR body and every commit carry
+`Initiative: plan-<initiative-id>` instead of a ticket reference.
+The body exception applies only after the branch and records-only diff qualify.
+Remote trunk refs, one simple push, and the `docs/orbit/` boundary remain required.
+Records lint checks initiative ownership and referenced Snapshots.

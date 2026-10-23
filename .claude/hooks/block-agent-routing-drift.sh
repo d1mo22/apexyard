@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # Pre-commit + pre-push drift guard for .claude/agents/*.md routing.
 #
 # Per AgDR-0050 § Axis 4 + ticket #351 PR 2 — the sibling to
@@ -39,19 +40,35 @@
 # agent had the rewritten file right in front of it during `git add`
 # and didn't actively suppress it.
 
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
 set -u
 
-INPUT=$(cat)
+INPUT="$_GIT_GATE_INPUT"
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Only fire on commit or push.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR/_lib-git-global.sh"
+fi
+
+# Only fire on commit or push. Global options may sit between git and the verb.
 IS_COMMIT=0
 IS_PUSH=0
-if echo "$COMMAND" | grep -qE '\bgit\s+commit\b'; then
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  if [ "${_GIT_VISIT_SUB:-commit}" = commit ] && command_has_git_subcommand "$COMMAND" commit; then
+    IS_COMMIT=1
+  elif command_has_git_subcommand "$COMMAND" push; then
+    IS_PUSH=1
+  else
+    exit 0
+  fi
+elif echo "$COMMAND" | grep -qE '\bgit\s+commit\b'; then
   IS_COMMIT=1
 elif echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
   IS_PUSH=1
@@ -59,7 +76,19 @@ else
   exit 0
 fi
 
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+PAYLOAD_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null || true)
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  if [ "$IS_COMMIT" -eq 1 ]; then
+    git_prepare_invocation "$COMMAND" commit "$PAYLOAD_CWD"
+  else
+    git_prepare_invocation "$COMMAND" push "$PAYLOAD_CWD"
+  fi
+fi
+if command -v git_target >/dev/null 2>&1; then
+  REPO_ROOT=$(git_target rev-parse --show-toplevel 2>/dev/null)
+else
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+fi
 if [ -z "$REPO_ROOT" ]; then
   exit 0
 fi
@@ -93,7 +122,7 @@ AGENTS_DIR="$ROOT/.claude/agents"
 get_candidate_files() {
   if [ "$IS_COMMIT" -eq 1 ]; then
     # Staged adds + modifies (renames + copies follow under R/C).
-    git -C "$ROOT" diff --cached --name-only --diff-filter=ACMR 2>/dev/null \
+    git -C "$ROOT" -c core.fsmonitor=false diff --no-ext-diff --no-textconv --cached --name-only --diff-filter=ACMR 2>/dev/null \
       | grep -E '^\.claude/agents/[^/]+\.md$' || true
     return 0
   fi
@@ -114,11 +143,11 @@ get_candidate_files() {
     if [ -z "$base" ]; then
       # Brand-new branch with no comparable base — fall back to the last
       # 5 commits (better than nothing without false-positiving).
-      git -C "$ROOT" diff --name-only HEAD~5..HEAD 2>/dev/null \
+      git -C "$ROOT" -c core.fsmonitor=false diff --no-ext-diff --no-textconv --name-only HEAD~5..HEAD 2>/dev/null \
         | grep -E '^\.claude/agents/[^/]+\.md$' || true
       return 0
     fi
-    git -C "$ROOT" diff --name-only "$base..HEAD" 2>/dev/null \
+    git -C "$ROOT" -c core.fsmonitor=false diff --no-ext-diff --no-textconv --name-only "$base..HEAD" 2>/dev/null \
       | grep -E '^\.claude/agents/[^/]+\.md$' || true
   fi
 }
@@ -290,3 +319,17 @@ See AgDR-0050 § Axis 4 for the design and
 MSG
 
 exit 2
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body block "$_GIT_GATE_INPUT" commit push
+  exit $?
+fi
+_git_gate_body

@@ -3,6 +3,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 RULE_FILE="$SRC_ROOT/.claude/rules/writing-standard.md"
 CASES_FILE="$SRC_ROOT/docs/quality-regression/fixtures/human-friendly-cases.md"
@@ -69,7 +74,12 @@ assert "template:pr-body" grep -qF 'controlled technical writing profile' "$SRC_
 assert "template:readme" grep -qF 'controlled technical writing profile' "$SRC_ROOT/templates/README.md"
 
 while IFS= read -r skill; do
-  assert "consumer:$skill:profile" grep -qF 'controlled technical writing profile' "$SRC_ROOT/.claude/skills/$skill/SKILL.md"
+  file="$SRC_ROOT/.claude/skills/$skill/SKILL.md"
+  if grep -qF 'Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.' "$file"; then
+    assert "consumer:$skill:profile" grep -qF 'controlled technical writing profile' "$SRC_ROOT/docs/skills/shared/writing-rule.md"
+  else
+    assert "consumer:$skill:profile" grep -qF 'controlled technical writing profile' "$file"
+  fi
 done < <(find "$SRC_ROOT/.claude/skills" -mindepth 2 -maxdepth 2 -name SKILL.md -exec sh -c 'basename "$(dirname "$1")"' _ {} \; | sort)
 assert "consumer:code-reviewer:profile" grep -qF 'controlled technical writing profile' "$SRC_ROOT/.claude/agents/code-reviewer.md"
 

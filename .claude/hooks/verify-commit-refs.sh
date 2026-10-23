@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # PreToolUse hook on `git commit -m / -F`: scans the commit message for
 # issue references (Closes #N, Refs #N, Fixes #N, Resolves #N, Related to #N)
 # and blocks the commit if any reference points at an issue that doesn't
@@ -29,7 +30,9 @@
 # Short-circuit: try the primary tracker first, only fall back to upstream on
 # miss. No double query for refs that resolve in origin.
 
-INPUT=$(cat)
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
+INPUT="$_GIT_GATE_INPUT"
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 if [ -z "$COMMAND" ]; then
@@ -44,7 +47,14 @@ fi
 # skipped ref verification altogether, regardless of any cwd-resolution fix
 # below. Round-3 review caught this: the WORKDIR resolver's `-C`-bound-to-
 # commit priority level was otherwise unreachable in practice.
-if ! echo "$COMMAND" | grep -qE '\bgit[[:space:]]+(-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)?commit\b'; then
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR/_lib-git-global.sh"
+fi
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  command_has_git_subcommand "$COMMAND" commit || exit 0
+elif ! echo "$COMMAND" | grep -qE '\bgit[[:space:]]+(-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)?commit\b'; then
   exit 0
 fi
 
@@ -240,11 +250,14 @@ resolve_commit_workdir_from_command() {
     prefix="$cmd"
   fi
 
-  # `-C <path>` immediately preceding THIS commit (`git -C <path> commit`).
-  # Anchored at the END of prefix so a `-C` on an earlier, unrelated git
-  # invocation in the same compound command does not match.
+  # `-C <path>` on THIS commit, including when another global option sits
+  # between -C and commit (`git -C <path> -c name=value commit`). The helper
+  # binds -C to the commit verb, so an earlier `git -C /other status` does
+  # not match. Only an absolute path is trusted (AgDR-0163).
   dir=""
-  if echo "$prefix" | grep -qE 'git[[:space:]]+-C[[:space:]]+"[^"]*"[[:space:]]*$'; then
+  if command -v git_invocation_dash_c >/dev/null 2>&1; then
+    dir=$(git_invocation_dash_c "${prefix} commit" commit)
+  elif echo "$prefix" | grep -qE 'git[[:space:]]+-C[[:space:]]+"[^"]*"[[:space:]]*$'; then
     dir=$(echo "$prefix" | sed -E 's/^.*git[[:space:]]+-C[[:space:]]+"([^"]*)"[[:space:]]*$/\1/')
   elif echo "$prefix" | grep -qE "git[[:space:]]+-C[[:space:]]+'[^']*'[[:space:]]*\$"; then
     dir=$(echo "$prefix" | sed -E "s/^.*git[[:space:]]+-C[[:space:]]+'([^']*)'[[:space:]]*\$/\1/")
@@ -284,6 +297,12 @@ CMD_SANS_MSG=$(strip_message_from_command "$COMMAND" "$MSG")
 WORKDIR=""
 WORKDIR_SOURCE="fallback"
 WORKDIR=$(resolve_commit_workdir_from_command "$CMD_SANS_MSG")
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  git_prepare_invocation "$COMMAND" commit "${PAYLOAD_CWD:-}"
+  if [ -n "${GIT_DASH_C:-}" ]; then
+    WORKDIR="$GIT_DASH_C"
+  fi
+fi
 if [ -n "$WORKDIR" ]; then
   WORKDIR_SOURCE="scraped_command"
 elif [ -n "$PAYLOAD_CWD" ] && [ "${PAYLOAD_CWD#/}" != "$PAYLOAD_CWD" ]; then
@@ -318,7 +337,15 @@ fi
 #     Both REPO_ROOT and the resolve_ops_root walk now start from WORKDIR
 #     (the commit's own directory) instead of $PWD — see above.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT=$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null)
+commit_repo_git() {
+  if command -v git_target >/dev/null 2>&1 && [ -n "${GIT_DASH_C:-}${_GIT_RAW_GIT_DIR:-}${_GIT_RAW_WORK_TREE:-}" ]; then
+    git_target "$@"
+  else
+    git -C "$WORKDIR" "$@"
+  fi
+}
+
+REPO_ROOT=$(commit_repo_git rev-parse --show-toplevel 2>/dev/null)
 CONFIG_ROOT=""
 if [ -f "$HOOK_DIR/_lib-ops-root.sh" ]; then
   # shellcheck disable=SC1090,SC1091
@@ -334,7 +361,7 @@ if [ -n "$CONFIG_ROOT" ] && [ -f "${CONFIG_ROOT}/.claude/project-config.json" ];
   TRACKER_REPO=$(jq -r '.tracker_repo // empty' "${CONFIG_ROOT}/.claude/project-config.json" 2>/dev/null)
 fi
 if [ -z "$TRACKER_REPO" ]; then
-  ORIGIN_URL=$(git -C "$WORKDIR" remote get-url origin 2>/dev/null)
+  ORIGIN_URL=$(commit_repo_git remote get-url origin 2>/dev/null)
   TRACKER_REPO=$(echo "$ORIGIN_URL" | sed -nE 's|.*[:/]([^/:]+/[^/]+)\.git$|\1|p; s|.*[:/]([^/:]+/[^/]+)$|\1|p' | head -1)
 fi
 
@@ -390,8 +417,8 @@ fi
 # Upstream fallback only applies to the gh kind. Linear / Jira / Asana
 # don't have a fork-of-a-tracker concept.
 UPSTREAM_REPO=""
-if [ "$TRACKER_KIND" = "gh" ] && git -C "$WORKDIR" remote get-url upstream >/dev/null 2>&1; then
-  UPSTREAM_URL=$(git -C "$WORKDIR" remote get-url upstream 2>/dev/null)
+if [ "$TRACKER_KIND" = "gh" ] && commit_repo_git remote get-url upstream >/dev/null 2>&1; then
+  UPSTREAM_URL=$(commit_repo_git remote get-url upstream 2>/dev/null)
   UPSTREAM_REPO=$(echo "$UPSTREAM_URL" | sed -nE 's|.*[:/]([^/:]+/[^/]+)\.git$|\1|p; s|.*[:/]([^/:]+/[^/]+)$|\1|p' | head -1)
   # Don't double-check if upstream resolves to the same repo as the primary
   # tracker (e.g. running INSIDE the framework repo itself, where origin and
@@ -411,13 +438,34 @@ fi
 MISSING=""
 CLOSED=""
 SHAPE_ONLY=""
+# Capture the tracker CLI's own stderr instead of discarding it, so the paths
+# below that block or warn can name the real cause (#1336). A ref that resolves
+# on the upstream fallback (#207) never records anything, so the ordinary
+# fork-to-upstream case stays silent.
+#
+# The snapshot matters: `2>` truncates on open, so a later ref's lookup — even a
+# successful one that writes nothing — would otherwise wipe the error belonging
+# to the ref that actually went missing. Copy the text out at the moment a ref
+# fails, and report that.
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on every lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
+TRACKER_ERR_TEXT=""
+
 for REF in $REFS; do
   NUM=$(echo "$REF" | tr -d '#')
   # Dispatch via the tracker lib. For non-gh kinds `--repo` may be a no-op.
-  ISSUE_JSON=$(tracker_view "$NUM" "$TRACKER_REPO" 2>/dev/null)
+  ISSUE_JSON=$(tracker_view "$NUM" "$TRACKER_REPO" 2>"$TRACKER_ERR")
   # Short-circuit: only consult upstream when the primary tracker missed.
   if [ -z "$ISSUE_JSON" ] && [ -n "$UPSTREAM_REPO" ]; then
-    ISSUE_JSON=$(tracker_view "$NUM" "$UPSTREAM_REPO" 2>/dev/null)
+    ISSUE_JSON=$(tracker_view "$NUM" "$UPSTREAM_REPO" 2>"$TRACKER_ERR")
   fi
   if [ -z "$ISSUE_JSON" ] && [ "$TRACKER_KIND" != "gh" ]; then
     # Non-gh tracker (Linear / Jira / Asana / custom) returned nothing — the
@@ -427,10 +475,12 @@ for REF in $REFS; do
     # Hard existence enforcement (adding to MISSING → exit 2) is retained ONLY
     # for tracker.kind == gh.
     SHAPE_ONLY="${SHAPE_ONLY}${REF} "
+    [ -s "$TRACKER_ERR" ] && TRACKER_ERR_TEXT=$(cat "$TRACKER_ERR")
     continue
   fi
   if [ -z "$ISSUE_JSON" ]; then
     MISSING="${MISSING}${REF} "
+    [ -s "$TRACKER_ERR" ] && TRACKER_ERR_TEXT=$(cat "$TRACKER_ERR")
     continue
   fi
   ISSUE_STATE=$(echo "$ISSUE_JSON" | jq -r '.state // empty' 2>/dev/null)
@@ -467,11 +517,19 @@ and use the returned number in your commit message.
 If the reference is truly informational (cross-repo link that can't be verified
 with \`gh issue view\`), write it as a plain URL instead of #N notation.
 MSG
+  if [ -n "$TRACKER_ERR_TEXT" ]; then
+    echo "Tracker CLI said:" >&2
+    printf '%s\n' "$TRACKER_ERR_TEXT" | sed 's/^/  /' >&2
+  fi
   exit 2
 fi
 
 if [ -n "$SHAPE_ONLY" ]; then
   echo "WARN: verify-commit-refs.sh: tracker '${TRACKER_KIND}' not queryable here — ${SHAPE_ONLY}accepted on shape only (no existence check). See #501." >&2
+  if [ -n "$TRACKER_ERR_TEXT" ]; then
+    echo "Tracker CLI said:" >&2
+    printf '%s\n' "$TRACKER_ERR_TEXT" | sed 's/^/  /' >&2
+  fi
 fi
 
 if [ -n "$CLOSED" ]; then
@@ -486,3 +544,17 @@ MSG
 fi
 
 exit 0
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body block "$_GIT_GATE_INPUT" commit
+  exit $?
+fi
+_git_gate_body

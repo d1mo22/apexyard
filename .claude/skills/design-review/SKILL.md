@@ -40,7 +40,7 @@ See [`.claude/rules/role-triggers.md`](../../rules/role-triggers.md) for the ful
 
 ## Running tests in a scratch clone
 
-Tariq may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export the PR head with `git archive | tar -x` into a literal non-git directory. The export step still needs an active session ticket. A later write to a literal path inside that directory can use the me2resh/apexyard#883 exemption. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/solution-architect.md` § "Running tests in a scratch clone".
+Tariq may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export with `git archive <ref> | tar -x -C <scratchpad>` into this session's scratchpad. A sanctioned review needs no ticket for that write. The agent file states the path rule. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/solution-architect.md` § "Running tests in a scratch clone".
 
 The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` while the active-reviewer marker exists. Prepare the scratch clone and fetch the PR head before step 0 arms the marker.
 
@@ -51,15 +51,10 @@ The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` w
 Before spawning the Solution Architect agent (Tariq) for a PR review, write the active-reviewer session marker. It records that this review pass is the sanctioned one and suppresses `warn-review-marker-write.sh`'s advisory warning on the `*-architecture.approved` write (same convention as `/code-review`'s rex marker; that hook warns and never blocks since #1026 — AgDR-0111). The marker is scoped to THIS Claude Code session (me2resh/apexyard#1376) — resolve its path through `active_reviewer_marker_path`, never write the bare `.claude/session/active-reviewer` path directly. Use the SAME resolved `owner/repo` from step 1 (below) — the sibling-repo resolution in split-portfolio v2 matters here too. At skill entry:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "architecture")
 mkdir -p "$(dirname "$active_marker")"
 printf '%s\n' "<owner/repo>#<pr>:architecture" > "$active_marker"
 ```
@@ -67,17 +62,14 @@ printf '%s\n' "<owner/repo>#<pr>:architecture" > "$active_marker"
 On skill exit (after the review is posted, whether or not the marker gets written), clear it. Shell variables do not persist across separate Bash tool calls, so the exit step re-resolves `ops_root` and `active_marker` from scratch — it does not reuse the step-0 variable, which would silently be empty in a later call and turn the `rm -f` into a no-op:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "architecture")
 rm -f "$active_marker"
 ```
+
+The marker is keyed on session, repo, PR and review kind (me2resh/apexyard#1649). Each review writes and clears only its own file, so reviews run at the same time. The mutation lock applies to review agents only; the orchestrator and build agents can keep working. Use the same `<owner/repo>`, `<pr>` and kind in the write step and the exit step. Spawn the reviewer with the Agent tool and `subagent_type: solution-architect`. Never use `general-purpose`: the lock finds a review agent by that type.
 
 Doc-only reviews (no PR yet) never write a marker, so this step is a no-op for them. Nothing mechanically stops a build-class sub-agent writing the same file; what makes this marker legitimate is that a real, independent review happened. See `.claude/hooks/warn-review-marker-write.sh` and `.claude/rules/pr-workflow.md` § "Build agents cannot self-review".
 

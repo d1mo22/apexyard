@@ -1,0 +1,65 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -18,6 +18,7 @@
+     "seed": "node scripts/seed.mjs"
+   },
+   "dependencies": {
++    "axios": "0.21.1",
+     "drizzle-orm": "0.45.4",
+     "next": "16.4.0",
+     "react": "19.3.0",
+diff --git a/package-lock.json b/package-lock.json
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,7 @@
+       "name": "scaffold-starter",
+       "version": "0.1.0",
+       "dependencies": {
++        "axios": "0.21.1",
+         "drizzle-orm": "0.45.4",
+         "next": "16.4.0",
+         "react": "19.3.0",
+@@ -2870,6 +2871,15 @@
+         "node": ">=4"
+       }
+     },
++    "node_modules/axios": {
++      "version": "0.21.1",
++      "resolved": "https://registry.npmjs.org/axios/-/axios-0.21.1.tgz",
++      "integrity": "sha512-dKQiRHxGD9PPRIUNIWvZhPTPpl1rf/OxTYKsqKUDjBwYylTvV7SjSHJb9ratfyzM6wCdLCOYLzs73qpg5c4iGA==",
++      "license": "MIT",
++      "dependencies": {
++        "follow-redirects": "^1.10.0"
++      }
++    },
+     "node_modules/axobject-query": {
+       "version": "4.1.0",
+       "resolved": "https://registry.npmjs.org/axobject-query/-/axobject-query-4.1.0.tgz",
+@@ -4209,6 +4219,26 @@
+       "integrity": "sha512-5+ybhBZANEJxaH3X5evAFatUxLfEHSr7n6kYJ+1Qd0mUqr4eu9gIf6GDbWHf8RJijHrjjO8G+la14SlL2SeS1Q==",
+       "dev": true,
+       "license": "ISC"
++    },
++    "node_modules/follow-redirects": {
++      "version": "1.16.1",
++      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.16.1.tgz",
++      "integrity": "sha512-FNvFGzoMLWmE6Yj9spb/zjd7yiNCHiAW9/Tg9CXrQ8wuu32HtlJOwWO11OJafl5FfY3DxTdQ0vj42zU1kvv5jg==",
++      "funding": [
++        {
++          "type": "individual",
++          "url": "https://github.com/sponsors/RubenVerborgh"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=4.0"
++      },
++      "peerDependenciesMeta": {
++        "debug": {
++          "optional": true
++        }
++      }
+     },
+     "node_modules/for-each": {
+       "version": "0.3.5",

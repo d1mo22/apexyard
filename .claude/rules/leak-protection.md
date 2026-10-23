@@ -20,6 +20,28 @@ Private project identifiers (names, repo slugs, workspace paths) belong in your 
 - `.projects[].repo` — exact `owner/repo` match, optionally followed by `#<N>` to catch ticket references. Skipped when equal to the target repo.
 - `.projects[].workspace` — whole-word match on the workspace path.
 
+## Public registry entries — `public: true`
+
+A registered project whose repo is public — a public marketing site, say —
+is not a private identifier. Add `public: true` to that entry in
+`apexyard.projects.yaml`:
+
+```yaml
+- name: marketing-site
+  repo: your-org/marketing-site
+  public: true
+```
+
+Every leak hook (`check-private-refs-staged.sh`, `check-private-refs-runtime.sh`,
+`block-private-refs-in-public-repos.sh`) reads the field through the shared
+parser at `.claude/hooks/_lib-registry-parser.sh` and skips that entry's
+`name`, `repo`/`repos`, and `workspace` when scanning for a leak
+(me2resh/apexyard#1455). Omitting the field, or setting it to anything other
+than `true`, keeps the entry private — the hooks fail closed by default.
+
+`public: true` is per-entry, not global: an unrelated private project two
+entries down in the same registry still blocks normally.
+
 ## What does NOT get scrubbed
 
 - The fork owner's git identity (name / email) — that's signed on every commit anyway.
@@ -78,13 +100,28 @@ check reads the index rather than a rendered net diff. An add-then-remove
 sequence cannot hide the first commit because the first commit is blocked.
 The diagnostic names the file and withholds the matched identifier.
 
+**Origin-private skip and push-time scan (#1528, AgDR-0220):** when `origin`
+is confirmed private, the staged scan exits 0, because a local commit leaks
+nothing. The protected-branch guard in `.githooks/pre-commit` still runs.
+`check-private-refs-push.sh`, called from `.githooks/pre-push`, scans every
+new blob, commit and tag object (message and author headers), file and
+directory name, and pushed ref name, including binary files and merge
+resolutions. It trusts only the remote sha git reports and tips it already
+scanned clean for the same registry; remote-tracking refs are never trusted. It skips only
+a remote that is confirmed private. Public-class remotes (the
+`public_framework_repos` list, the `upstream` remote, a registry entry with
+`public: true`), an unknown or failed visibility lookup, and non-GitHub hosts
+all scan. Visibility comes from `gh api repos/<slug> --jq .private`, cached
+24 hours in local git config (a failed lookup for 10 minutes). Skipping hooks on push skips this scan like any
+git hook. There is no dedicated skip variable.
+
 The tracker adapters also run `check-private-refs-runtime.sh` after resolving
 their arguments. This covers `tracker_create`, `tracker_review_submit`, and
 `tracker_pr_merge` when their repository or body-file argument comes from a
 shell variable. The command-text hook still protects direct `gh` calls.
 
 Git's `--no-verify` option and a clone without `core.hooksPath=.githooks`
-can bypass the staged-content gate. The command-layer hook remains a backstop
+can bypass the staged-content and push-time gates. The command-layer hook remains a backstop
 for agent-driven writes. Treat either bypass as reduced protection, not as a
 reason to commit private identifiers.
 
@@ -157,7 +194,7 @@ purge your own repository's objects. It cannot reach a fork.
 
 If a project's `name` collides with a generic word (a project literally named `auth`, or `core`), the hook will block any upstream ticket that uses that word. Mitigations:
 
-1. **Don't register a private project under a generic one-word name.** `curios-dog` is fine; `auth` is not. This is a good principle independent of leak protection — it also stops `/projects` and `/tasks` from colliding.
+1. **Don't register a private project under a generic one-word name.** `sample-app` is fine; `auth` is not. This is a good principle independent of leak protection — it also stops `/projects` and `/tasks` from colliding.
 2. **Use the skip marker** when you've confirmed the match is incidental. The warning that accompanies the bypass is visible and auditable.
 3. **Omit the `name` field temporarily** — the hook reads only registered fields, so redacting one project's name in the registry removes it from the scrub list. Least-preferred option; you lose discovery in `/projects` for that project.
 
@@ -169,7 +206,8 @@ The leak-protection hook is a **sibling to `check-secrets.sh`** — both scan ou
 |------|----------|------|
 | `check-secrets.sh` | API keys, passwords, tokens | `git commit` time (staged diff) |
 | `block-private-refs-in-public-repos.sh` | Project names, repo slugs, workspace paths | `gh` tracker-write time (issue/PR title + body, review body, merge-commit subject/body) |
-| `check-private-refs-staged.sh` | Project names, repo slugs, workspace paths in complete files | Git-native `pre-commit` time (staged blobs) |
+| `check-private-refs-staged.sh` | Project names, repo slugs, workspace paths in complete files | Git-native `pre-commit` time (staged blobs); skipped when origin is confirmed private |
+| `check-private-refs-push.sh` | Same identifiers in new blobs and messages of pushed objects | Git-native `pre-push` time; skipped only for a confirmed-private remote |
 
 Both are backstops against routine-but-damaging leaks. Self-discipline is the primary defence; the hook catches the cases where the agent had the private information right in front of it while writing the upstream content and didn't actively suppress it.
 

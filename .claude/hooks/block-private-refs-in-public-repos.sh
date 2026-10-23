@@ -422,135 +422,14 @@ fi
 #    `-F body=@file` / `-f body=...`.
 # ---------------------------------------------------------------------------
 
-extract_flag_value() {
-  # $1 = python-flag regex (e.g. --title | -t). Matches (possibly multi-line):
-  #   --title "value with spaces"
-  #   --title 'value'
-  #   --title value
-  #
-  # Quoted-value regex is GREEDY and anchored on the next flag boundary
-  # (whitespace + `--<letter>`) or end-of-string. The earlier sed form
-  # `[^"]*` truncated at the first embedded double quote
-  # (me2resh/apexyard#227); for the leak-protection hook that's a real
-  # security tail — a body with an embedded `"` could let private refs in
-  # the back half slip past the gate. awk + greedy + boundary anchor
-  # gives us multi-line consumption and correct termination in one shot.
-  # $3 = trim mode. Default "last" (greedy retention, for leak DETECTION).
-  # Pass "first" for the conservative subset the skip-marker check needs —
-  # see the SCOPE ASYMMETRY note below.
-  #
-  # INVARIANT for anyone adding a caller: any consumer that makes an
-  # ALLOW / bypass decision MUST pass "first". Detection consumers take the
-  # default. The default is deliberately the detection-safe one, which means
-  # a new allow-path caller that forgets $3 silently gets the superset — and
-  # a superset is fail-OPEN in that direction. Read the asymmetry note before
-  # adding a call site.
-  local flag_re="$1"
-  local cmd="$2"
-  local mode="${3:-last}"
-  printf '%s' "$cmd" | awk -v FLAG_RE="$flag_re" -v SQ="'" -v MODE="$mode" '
-    # Truncate CHUNK at its LAST occurrence of delimiter D.
-    #
-    # A regex sub() cannot do this job (me2resh/apexyard#1046). POSIX ERE
-    # substitution is leftmost-longest, so the previous
-    #   sub("\"([[:space:]]+--[a-zA-Z].*)?$", "", chunk)
-    # found the EARLIEST quote that happened to be followed by ` --<letter>`
-    # and deleted from there to end-of-string. A body containing an embedded
-    # quote and, later, any double-dash token was therefore amputated at the
-    # quote, and everything after it went unscanned — a silent fail-open on a
-    # leak gate. Both conditions had to co-occur, which is why the originally
-    # filed single-condition repro did not reproduce.
-    #
-    # Scanning backwards is exact rather than heuristic: match() already
-    # anchored the region on the real closing delimiter, and the only thing
-    # that can follow it is the boundary ` --<letter>` or trailing space,
-    # neither of which contains a delimiter. So the last D in CHUNK IS the
-    # closing delimiter, including when the body legitimately ends in one.
-    #
-    # This deliberately does NOT touch the greedy match() anchors above it.
-    # Widening those was tried in #1040 and rejected: it reopened #227 across
-    # every boundary character (9 failures vs 5 — measurably worse than no
-    # fix). The anchor was never the defect; the trim was.
-    function trim_to_last(chunk, d,    i) {
-      for (i = length(chunk); i >= 1; i--) {
-        if (substr(chunk, i, 1) == d) return substr(chunk, 1, i - 1)
-      }
-      return chunk
-    }
-    # SCOPE ASYMMETRY (me2resh/apexyard#1046, caught in security review).
-    #
-    # Retaining a SUPERSET is fail-closed for leak DETECTION — scanning more
-    # than the body can only over-block. It is fail-OPEN for the skip MARKER,
-    # because a wider scan gives `<!-- private-refs: allow -->` more places to
-    # be found. Concretely, `--body "<private>" --label "<marker>"` blocked
-    # before this fix and bypassed after it: the greedy match legitimately
-    # cannot tell where the body ends, so the marker rode in on the
-    # over-capture.
-    #
-    # So the two consumers need opposite trims. Detection uses "last" (the
-    # superset). The marker check uses "first" — the pre-fix earliest-
-    # qualifying cut, which is a SUBSET and therefore fail-closed in the
-    # bypass direction. "first" is deliberately the OLD, buggy-for-detection
-    # behaviour: its under-capture is precisely the property that makes it
-    # correct here.
-    function trim_mode(chunk, d) {
-      if (MODE != "first") return trim_to_last(chunk, d)
-      # `--?` here, NOT `--`. A single-dash flag is the same flag: `-l` IS
-      # `--label`. Keying the conservative cut on a double dash closed
-      # `--label "<marker>"` and left `-l "<marker>"` open, so the subset
-      # silently became a superset again for the short spellings.
-      #
-      # `--?` and NOT `-{1,2}`, which is what this originally used: `{n,m}`
-      # is an ERE interval and awk support for it is not universal (mawk
-      # 1.3.3 lacks it; BWK awk only gained it around 2019; gawk 3.x needed
-      # --re-interval). Where it is unsupported the pattern is treated
-      # LITERALLY, the cut then fires only at end-of-chunk, and this branch
-      # silently degrades back toward the superset — reopening the very
-      # bypass it exists to close, on some machines and not others. That is
-      # the same silent-failure class as the bug this hook is fixing, so the
-      # dependency is not worth carrying when `--?` is exactly equivalent.
-      #
-      # Safe by construction: a more aggressive cut yields a SMALLER subset,
-      # and smaller is fail-closed for the marker consumer. This branch is
-      # never reached by leak detection, which always uses "last", so it
-      # cannot affect #227/#1039 behaviour.
-      sub(d "([[:space:]]+--?[a-zA-Z].*)?$", "", chunk)
-      sub(d "[[:space:]]*$", "", chunk)
-      return chunk
-    }
-    { buf = (NR == 1 ? $0 : buf "\n" $0) }
-    END {
-      s = buf
-      # Double-quoted value: greedy `(.*)` anchored on next flag or EOS.
-      re = "(" FLAG_RE ")[[:space:]]+\"(.*)\"([[:space:]]+--[a-zA-Z]|[[:space:]]*$)"
-      if (match(s, re)) {
-        chunk = substr(s, RSTART, RLENGTH)
-        sub("^(" FLAG_RE ")[[:space:]]+\"", "", chunk)
-        print trim_mode(chunk, "\"")
-        exit
-      }
-      # Single-quoted value: same greedy + anchor treatment. This branch had
-      # the identical leftmost-longest defect and is fixed the same way; it is
-      # not mentioned in #1046 but leaks on the single-quoted equivalent of the
-      # same command shape.
-      re = "(" FLAG_RE ")[[:space:]]+" SQ "(.*)" SQ "([[:space:]]+--[a-zA-Z]|[[:space:]]*$)"
-      if (match(s, re)) {
-        chunk = substr(s, RSTART, RLENGTH)
-        sub("^(" FLAG_RE ")[[:space:]]+" SQ, "", chunk)
-        print trim_mode(chunk, SQ)
-        exit
-      }
-      # Unquoted value: single token, embedded quotes irrelevant.
-      re = "(" FLAG_RE ")[[:space:]]+[^[:space:]]+"
-      if (match(s, re)) {
-        chunk = substr(s, RSTART, RLENGTH)
-        sub("^(" FLAG_RE ")[[:space:]]+", "", chunk)
-        print chunk
-        exit
-      }
-    }
-  '
-}
+flag_lib="$(dirname "$0")/_lib-flag-value.sh"
+if [ ! -r "$flag_lib" ]; then
+  echo "BLOCKED: _lib-flag-value.sh is missing. Cannot read tracker flags." >&2
+  exit 2
+fi
+# shellcheck source=./_lib-flag-value.sh
+. "$flag_lib"
+
 
 # extract_path_flag FLAG_RE COMMAND  (me2resh/apexyard#1039)
 #
@@ -561,7 +440,8 @@ extract_flag_value() {
 #     anything — quotes, pipes, semicolons, markdown tables. Extraction must
 #     be GREEDY and terminate only on a real flag boundary, or an embedded
 #     quote truncates the body and the tail goes unscanned. That is exactly
-#     the leak #227 fixed, so extract_flag_value above stays as it is.
+#     the leak #227 fixed. Detection calls pass trim `last` to
+#     _lib-flag-value.sh. The skip-marker calls pass `first`.
 #
 #   PATH (--body-file / -F): a filesystem path. It never contains a quote
 #     character, so extraction must be NON-GREEDY — stop at the FIRST
@@ -627,8 +507,8 @@ extract_path_flag() {
 # Only the long form was missing. Folding it in means --subject inherits the
 # existing greedy extraction AND the truncation check below for free,
 # instead of duplicating both for one more flag.
-TITLE=$(extract_flag_value '--title|--subject|-t' "$COMMAND")
-BODY=$(extract_flag_value '--body|-b' "$COMMAND")
+TITLE=$(extract_flag_value '--title|--subject|-t' "$COMMAND" last)
+BODY=$(extract_flag_value '--body|-b' "$COMMAND" last)
 
 # #1206 H2 — fold in the wrapper's positional title/subject when the flag-
 # based extraction above found nothing. tracker_create's title is argument
@@ -750,7 +630,7 @@ EOF
 fi
 
 # Conservative (subset) extraction, used ONLY for the skip-marker check in
-# step 6. See the SCOPE ASYMMETRY note in extract_flag_value: the greedy
+# step 6. See the SCOPE ASYMMETRY note in _lib-flag-value.sh: the greedy
 # extraction above is fail-closed for detection but fail-OPEN for the bypass
 # marker, because over-capture hands the marker extra places to appear.
 TITLE_STRICT=$(extract_flag_value '--title|--subject|-t' "$COMMAND" first)
@@ -1089,80 +969,81 @@ fi
 #    _lib-multi-repo-trace.sh.
 # ---------------------------------------------------------------------------
 
-NAMES=""
-REPOS=""
-WORKSPACES=""
+# apexyard#1457 review round 2 (Hakim LOW-2) — indexed arrays, not
+# space-joined strings: NAMES_PUBLIC[i] / REPOS_PUBLIC[i] / WORKSPACES_PUBLIC[i]
+# pair with NAMES[i] / REPOS[i] / WORKSPACES[i] by POSITION, the same
+# per-entry pairing the staged and runtime hooks use. A membership-only
+# check (the pre-round-2 approach) could not tell two entries with the same
+# token apart; this can.
+NAMES=()
+NAMES_PUBLIC=()
+REPOS=()
+REPOS_PUBLIC=()
+WORKSPACES=()
+WORKSPACES_PUBLIC=()
 
-# awk parser: walk each `- name:` block and pull out `name`, every `repo`/
-# `repos[]` entry, and `workspace`. Strips surrounding quotes. Assumes
-# `- name:` is the first key in each project entry (same assumption as
-# /start-ticket).
-PARSED=$(awk '
-  function unquote(s) { gsub(/^["\x27]|["\x27]$/, "", s); return s }
-  /^[[:space:]]*- name:/ {
-    print "NAME=" unquote($3)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repo:/ {
-    print "REPO=" unquote($2)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*workspace:/ {
-    print "WORKSPACE=" unquote($2)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repos:[[:space:]]*\[/ {
-    line = $0
-    sub(/^[^\[]*\[/, "", line); sub(/\].*$/, "", line)
-    n = split(line, parts, ",")
-    for (i = 1; i <= n; i++) {
-      item = parts[i]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
-      if (item != "") print "REPO=" unquote(item)
-    }
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repos:[[:space:]]*(#.*)?$/ {
-    current_list = "repos"
-    next
-  }
-  /^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_-]*:/ {
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*-[[:space:]]+/ {
-    if (current_list == "repos") {
-      item = $0
-      sub(/^[[:space:]]*-[[:space:]]+/, "", item)
-      gsub(/[[:space:]]+$/, "", item)
-      print "REPO=" unquote(item)
-    }
-    next
-  }
-' "$REGISTRY")
+HOOK_DIR_FOR_PARSER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$HOOK_DIR_FOR_PARSER/_lib-registry-parser.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOK_DIR_FOR_PARSER/_lib-registry-parser.sh"
+fi
 
+# apexyard#1457 review round 2 (Rex B1 / Hakim HIGH-2) — the registry
+# exists (checked earlier), so fail closed rather than silently scanning
+# nothing when the shared parser is missing or its parse fails.
+if ! declare -F registry_parse_entries >/dev/null 2>&1; then
+  echo "BLOCKED: shared registry parser (_lib-registry-parser.sh) is missing or failed to load. Cannot safely scan for a private portfolio reference." >&2
+  exit 2
+fi
+REGISTRY_PARSED=$(registry_parse_entries "$REGISTRY")
+REGISTRY_PARSE_RC=$?
+if [ "$REGISTRY_PARSE_RC" -ne 0 ]; then
+  echo "BLOCKED: registry parse failed (exit $REGISTRY_PARSE_RC) while scanning for a private portfolio reference." >&2
+  exit 2
+fi
+
+CURRENT_PUBLIC=0
 while IFS= read -r line; do
   case "$line" in
+    PUBLIC=*)
+      CURRENT_PUBLIC=${line#PUBLIC=}
+      ;;
     NAME=*)
       v=${line#NAME=}
-      [ -n "$v" ] && NAMES="$NAMES $v"
+      if [ -n "$v" ]; then
+        NAMES+=("$v")
+        NAMES_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
     REPO=*)
       v=${line#REPO=}
-      [ -n "$v" ] && REPOS="$REPOS $v"
+      if [ -n "$v" ]; then
+        REPOS+=("$v")
+        REPOS_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
     WORKSPACE=*)
       v=${line#WORKSPACE=}
-      [ -n "$v" ] && WORKSPACES="$WORKSPACES $v"
+      if [ -n "$v" ]; then
+        WORKSPACES+=("$v")
+        WORKSPACES_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
   esac
 done <<EOF
-$PARSED
+$REGISTRY_PARSED
 EOF
+
+# apexyard#1457 review round 3 (Hakim MEDIUM, elevated to blocking) — a
+# registry that plainly looks like it registers projects (a `projects:`
+# key AND at least one `name:` key) but produced zero tokens means the
+# parse missed a shape, not that nothing is registered. Fail closed.
+if [ "${#NAMES[@]}" -eq 0 ] && [ "${#REPOS[@]}" -eq 0 ] && [ "${#WORKSPACES[@]}" -eq 0 ]; then
+  if registry_has_project_shape "$REGISTRY"; then
+    echo "BLOCKED: registry parse produced no tokens despite a projects: key and a name: key being present in $REGISTRY. Cannot safely scan for a private portfolio reference." >&2
+    exit 2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Build the match list.
@@ -1203,7 +1084,12 @@ record_if_match() {
   fi
 }
 
-for n in $NAMES; do
+for name_idx in "${!NAMES[@]}"; do
+  n="${NAMES[$name_idx]}"
+  # apexyard#1455 — a registry entry marked `public: true` is not a leak.
+  # apexyard#1457 review round 2 (Hakim LOW-2) — paired by INDEX with the
+  # entry that produced $n, not by token-string membership.
+  [ "${NAMES_PUBLIC[$name_idx]}" = "1" ] && continue
   # Exempt the target repo's own bare name entirely (pre-existing).
   if [ "$n" = "$TARGET_NAME" ]; then continue; fi
 
@@ -1260,17 +1146,22 @@ for n in $NAMES; do
   fi
 done
 
-for rp in $REPOS; do
+for repo_idx in "${!REPOS[@]}"; do
+  rp="${REPOS[$repo_idx]}"
+  [ "${REPOS_PUBLIC[$repo_idx]}" = "1" ] && continue
   if [ "$rp" = "$TARGET_REPO" ]; then continue; fi
   esc=$(printf '%s' "$rp" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
-  # Either bare slug (with word-ish boundary) or slug#<N>.
-  if echo "$HAYSTACK" | grep -qiE "(^|[^A-Za-z0-9_/-])${esc}(#[0-9]+)?([^A-Za-z0-9_/-]|$)"; then
+  # A slash can precede a slug in a URL or follow it in an issue path.
+  # Keep hyphens excluded so a slug within a longer token stays unmatched.
+  if echo "$HAYSTACK" | grep -qiE "(^|[^A-Za-z0-9_-])${esc}(#[0-9]+)?([^A-Za-z0-9_-]|$)"; then
     LEAKS="$LEAKS
   - project repo: $rp"
   fi
 done
 
-for ws in $WORKSPACES; do
+for ws_idx in "${!WORKSPACES[@]}"; do
+  ws="${WORKSPACES[$ws_idx]}"
+  [ "${WORKSPACES_PUBLIC[$ws_idx]}" = "1" ] && continue
   esc=$(printf '%s' "$ws" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
   # Workspace-path boundaries: path-chars `/` and `-` ARE allowed *after* the
   # match (e.g. `workspace/ws-marlow/app.ts` is a real reference — the

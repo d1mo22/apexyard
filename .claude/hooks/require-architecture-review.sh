@@ -67,7 +67,8 @@ INPUT=$(cat)
 # builtin, so it never triggers that behavior; this function never calls
 # `.` on a path it has not already confirmed is readable.
 _require_lib() {
-  local lib="$1"
+  local lib="$1" fn
+  shift
   if [ ! -r "$lib" ]; then
     echo "BLOCKED: merge gate cannot load a required library." >&2
     echo "Missing or unreadable: $lib" >&2
@@ -83,6 +84,12 @@ _require_lib() {
     echo "instead of skipping the check. Fix the file and retry." >&2
     exit 2
   fi
+  for fn in "$@"; do
+    if ! command -v "$fn" >/dev/null 2>&1 || ! declare -F "$fn" >/dev/null 2>&1; then
+      printf 'BLOCKED: merge gate missing required function %s after sourcing %s. Restore the library and retry.\n' "$fn" "$lib" >&2
+      exit 2
+    fi
+  done
 }
 
 # Shared merge-shape detector + PR-number parser (see _lib-extract-pr.sh).
@@ -91,9 +98,15 @@ _require_lib() {
 # original position after the parse) so is_merge_command is available as
 # the jq-independent fallback detector when the parse can't be trusted —
 # see #965.
-_require_lib "$(dirname "$0")/_lib-extract-pr.sh"
+_require_lib "$(dirname "$0")/_lib-extract-pr.sh" \
+  is_merge_command is_merge_command_raw \
+  _run_awk_or_fallback join_shell_continuations _join_shell_continuations_fallback \
+  _scrub_merge_command _has_split_merge_phrase _normalize_json_escapes \
+  has_conflicting_repo_flags merge_command_uses_variable extract_pr_number resolve_merge_repo resolve_pr_head \
+  prmeta_get prmeta_file_list
 # Repo-qualified marker path helper (#485).
-_require_lib "$(dirname "$0")/_lib-review-markers.sh"
+_require_lib "$(dirname "$0")/_lib-review-markers.sh" \
+  review_marker_path unqualified_marker_hint
 # cd-target → origin recovery for the no---repo split-portfolio merge (#687).
 # Required here (unlike its optional `if [ -f ]` treatment in
 # block-unreviewed-merge.sh / block-merge-on-red-ci.sh) — this hook has
@@ -102,7 +115,7 @@ _require_lib "$(dirname "$0")/_lib-review-markers.sh"
 # either silently continuing (default bash) or fatally exiting the whole
 # script before this hook's own BLOCKED logic can run (POSIX mode). See
 # me2resh/apexyard#1405 review (Hakim's second matrix) and AgDR-0169.
-_require_lib "$(dirname "$0")/_lib-pr-repo.sh"
+_require_lib "$(dirname "$0")/_lib-pr-repo.sh" pr_cmd_cd_target git_origin_repo
 
 # Parse .tool_input.command via jq. #965: this used to be the ONLY parse
 # path, and an empty/failed result — jq missing from PATH, or jq erroring
@@ -149,18 +162,30 @@ if [ -z "$COMMAND" ]; then
   # hook sees. A payload that DOES look merge-shaped but that we can't
   # safely parse/verify fails CLOSED (exit 2) instead of silently letting
   # an unreviewed design artifact through.
-  if is_merge_command "$(_normalize_json_escapes "$INPUT")"; then
+  if is_merge_command_raw "$(_normalize_json_escapes "$INPUT")"; then
     echo "BLOCKED: architecture-review gate cannot evaluate this command — jq is unavailable or .tool_input.command could not be parsed, but the raw input looks merge-related. Refusing to merge until this can be verified. Restore jq (see .claude/hooks/check-jq-installed.sh) and retry." >&2
     exit 2
   fi
   exit 0
 fi
 
+_has_split_merge_phrase "$COMMAND"
+scan_status=$?
+if [ "$scan_status" -eq 2 ]; then
+  echo "BLOCKED: merge gate could not scan the command. Check awk and the command size." >&2
+  exit 2
+fi
+
 if ! is_merge_command "$COMMAND"; then
   exit 0
 fi
 
-if merge_command_uses_variable "$COMMAND"; then
+if has_conflicting_repo_flags "$COMMAND"; then
+  echo "BLOCKED: merge command has conflicting repo flags. Re-run with one repo value." >&2
+  exit 2
+fi
+
+if merge_command_uses_variable "$COMMAND" "$scan_status"; then
   echo "BLOCKED: architecture-review gate cannot resolve a merge command containing an unexpanded PR or repo variable. Re-run with literal values." >&2
   exit 2
 fi
@@ -206,16 +231,24 @@ fi
 # Get the PR's changed files. The diff endpoint rejects responses over 300
 # files; the files API is paginated and supports larger PRs. It caps at 3,000
 # files, so refuse to evaluate a truncated result rather than fail open.
-CHANGED_FILE_LIST=$(mktemp "${TMPDIR:-/tmp}/apexyard-pr-files.XXXXXX") || exit 2
+#
+# The dispatcher snapshot gives the count and the list first (AgDR-0256).
+# On a miss, the gate makes its own two calls. It reads the output straight
+# into memory. A temporary file let a same-uid process rewrite the list
+# between the write and the read (AgDR-0256 D2 rules 24 and 25).
 CHANGED_RC=0
 TOTAL_FILES=""
-if [ -z "$CMD_REPO" ] || ! TOTAL_FILES=$(gh api "repos/${CMD_REPO}/pulls/${PR_NUMBER}" --jq '.changed_files' 2>/dev/null) || ! printf '%s' "$TOTAL_FILES" | grep -qE '^[0-9]+$' || [ "$TOTAL_FILES" -gt 3000 ] || ! gh api --paginate "repos/${CMD_REPO}/pulls/${PR_NUMBER}/files?per_page=100" --jq '.[].filename' >"$CHANGED_FILE_LIST" 2>/dev/null; then
-  CHANGED_RC=1
+CHANGED=""
+if [ -n "$CMD_REPO" ] && CHANGED=$(prmeta_file_list "$PR_NUMBER" "$CMD_REPO") \
+  && TOTAL_FILES=$(prmeta_get count "$PR_NUMBER" "$CMD_REPO"); then
+  CHANGED_RC=0
+else
+  CHANGED=""
+  TOTAL_FILES=""
+  if [ -z "$CMD_REPO" ] || ! TOTAL_FILES=$(apexyard_gh api "repos/${CMD_REPO}/pulls/${PR_NUMBER}" --jq '.changed_files' 2>/dev/null) || ! printf '%s' "$TOTAL_FILES" | grep -qE '^[0-9]+$' || [ "$TOTAL_FILES" -gt 3000 ] || ! CHANGED=$(apexyard_gh api --paginate "repos/${CMD_REPO}/pulls/${PR_NUMBER}/files?per_page=100" --jq '.[].filename' 2>/dev/null); then
+    CHANGED_RC=1
+  fi
 fi
-CHANGED_COUNT=$(wc -l <"$CHANGED_FILE_LIST" 2>/dev/null | tr -d ' ')
-CHANGED_COUNT=${CHANGED_COUNT:-0}
-CHANGED=$(cat "$CHANGED_FILE_LIST" 2>/dev/null)
-rm -f "$CHANGED_FILE_LIST"
 if [ "$CHANGED_RC" -ne 0 ] || [ -z "$CHANGED" ] || [ "$TOTAL_FILES" -gt 3000 ]; then
   echo "BLOCKED: architecture-review gate could not determine the PR's changed files. Refusing to merge until the diff can be verified." >&2
   exit 2
@@ -280,6 +313,9 @@ To unblock:
      AgDR linkage, risk, trade-offs, traceability, migration safety).
   2. On an APPROVED verdict, Tariq writes the marker automatically. A human
      architect can instead record it with /approve-architecture ${PR_NUMBER}.
+     Or show the approval menu. The question must name the repo, the PR,
+     and the full head SHA. record-menu-approval.sh writes the marker
+     when the operator selects the approve option. Do not write it yourself.
   3. Retry the merge.
 
 To customize which file patterns count as a "design artifact":
@@ -307,7 +343,26 @@ fi
 # local HEAD (see #55). If that resolution fails we BLOCK rather than fall back
 # to the local HEAD (#1091) — a local value is agent-controlled, so falling
 # back would silently void the check.
-APPROVED_SHA=$(tr -d '[:space:]' < "$APPROVAL")
+#
+# Tariq and /approve-architecture write a bare SHA. The menu path
+# (AgDR-0234) writes a structured record. This gate still requires an
+# exact head match.
+if grep -q '^approval_channel=' "$APPROVAL" 2>/dev/null; then
+  _menu_lib="$(dirname "$0")/_lib-menu-approval.sh"
+  if [ ! -r "$_menu_lib" ]; then
+    echo "BLOCKED: architecture gate cannot load _lib-menu-approval.sh." >&2
+    exit 2
+  fi
+  # shellcheck source=/dev/null
+  . "$_menu_lib"
+  APPROVED_SHA=$(menu_approval_record_sha "$APPROVAL") || {
+    echo "BLOCKED: architecture approval menu record is invalid." >&2
+    echo "Re-run the approval menu or /approve-architecture ${PR_NUMBER}." >&2
+    exit 2
+  }
+else
+  APPROVED_SHA=$(tr -d '[:space:]' < "$APPROVAL")
+fi
 CURRENT_SHA=$(resolve_pr_head "$PR_NUMBER" "$CMD_REPO")
 if [ -z "$CURRENT_SHA" ]; then
   cat >&2 <<MSG

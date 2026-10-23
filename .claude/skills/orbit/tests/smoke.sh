@@ -14,8 +14,23 @@ grep -q 'validate --all --root "\$orbit_root"' "$skill"
 grep -q 'not-verified' "$skill"
 grep -q 'Naqid' "$skill"
 grep -q 'no-challenge' "$skill"
-grep -q 'does not create issues' "$skill"
-! grep -q 'gh issue create' "$skill"
-! grep -q 'gh pr merge' "$skill"
+# apexyard#1565: slice continues through handoff after the record merges.
+grep -q 'slice.*ends with the.*handoff.*issue step' "$skill"
+grep -q 'record PR reviewed and merged' "$skill"
+grep -q 'ORBIT slice:' "$skill"
+grep -q 'does not create branches, commits, code changes, or deployments' "$skill"
+grep -q 'gh issue create' "$skill"
+grep -q 'active-issue-skill' "$skill"
+grep -q 'Remove the marker on' "$skill"
+
+# AgDR-0225 (apexyard#1626): lint, cycle PR, change-only reconcile, status.
+grep -q 'records-lint.sh' "$skill"
+grep -q 'stops on the first fault' "$skill"
+grep -q 'Planning cycle: one records PR' "$skill"
+grep -q 'record-check.sh' "$skill"
+grep -q 'checked, no change' "$skill"
+grep -q 'status-live.sh' "$skill"
+grep -q 'writes no record' "$skill"
+for f in records-lint.sh record-check.sh status-live.sh; do test -x "$skill_dir/lib/$f"; done
 
 echo "orbit skill smoke test passed"

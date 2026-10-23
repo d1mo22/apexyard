@@ -2,7 +2,7 @@
 name: update
 description: Sync the ApexYard fork with upstream — preview, merge-or-rebase on a sync branch, walk per-version migrations.
 argument-hint: "[--dry-run] [--rebase] [--from-version vN.N.N] [--skip-migrations] [--skip-adapter-sync]"
-allowed-tools: Bash, Read, Write, Edit
+allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 ---
 
 <!--
@@ -76,6 +76,11 @@ remain unchanged, but stale generated adapter files may be refreshed.
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### Pre-step: Parse flags + print pre-release banner (when --from-dev)
 
 Parse the invocation arguments first, BEFORE any fetch / branch / merge work:
@@ -138,7 +143,10 @@ The banner restates the deal every invocation — an operator who used `--from-d
 `/update` edits framework-root files (resolving merge conflicts, updating CLAUDE.md imports, etc.) which the `require-active-ticket.sh` PreToolUse hook would otherwise block when the only "ticket" is the upstream-sync work itself. Write a marker so the hook exempts this skill (it's on the default `bootstrap_skills` list in `.claude/project-config.defaults.json`):
 
 ```bash
-mkdir -p .claude/session && echo "update" > .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+mkdir -p "$marker_home/.claude/session" && echo "update" > "$skill_marker"
 ```
 
 Clear the marker on completion (last step of this skill). If the skill is interrupted, the SessionStart hook `clear-bootstrap-marker.sh` clears it at the start of the next session. See AgDR-0011 + me2resh/apexyard#150.
@@ -240,7 +248,10 @@ Then report. Examples:
 
 ```bash
 reconcile_installed_codex_adapter || exit 1
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 
 echo "Fork is up to date with upstream/main. Nothing to sync."
 ```
@@ -327,6 +338,8 @@ If `--dry-run` is set, show the preview and exit without touching anything else.
 
 If not already specified by flag:
 
+Use `AskUserQuestion` for merge or rebase. Recommend merge first and describe how each choice changes history. Use the prompt below only without the tool.
+
 ```
 Sync strategy:
   (1) merge   — creates a merge commit. Local history is preserved as-is. Safer for shared branches. DEFAULT.
@@ -384,6 +397,8 @@ Capture stdout/stderr for the conflict-detection step.
 
 If merge/rebase reports conflicts, show the user one file at a time:
 
+Use `AskUserQuestion` for each file. Recommend `Open in editor` first. Use the prompt below only without the tool.
+
 ```
 CONFLICT in .claude/rules/pr-workflow.md
 
@@ -425,6 +440,8 @@ git branch -D "$BRANCH"
 After the merge / rebase has applied (so the new `.claude/project-config.defaults.json` is on disk), scan the adopter's `.claude/project-config.json` for **top-level keys that no longer exist in defaults** — typically a config block removed upstream (e.g. `voice_prompts` removed in me2resh/apexyard#157) that still lingers in the override as dead config.
 
 This is **advisory only**. Custom-extension keys an adopter has added (their own hooks, in-house extensions) are also surfaced — the detector cannot tell them apart from upstream-removed keys, and only the operator can. The y/n/s offer below is the human-in-the-loop step that disambiguates.
+
+The helper skips keys listed in the defaults file's `_override_only_keys`. Those are supported keys that a hook reads only when an adopter sets one, so they are absent from defaults by design and are live configuration rather than dead config (me2resh/apexyard#1363). Accepting a deletion offer for one of them would silently disable the gate that reads it.
 
 #### Detection
 
@@ -715,6 +732,8 @@ If `TARGET_VERSION` is empty (no tags reachable — rare but possible on a fresh
 
 If `CURRENT_VERSION="unknown"` AND `--from-version` was NOT passed:
 
+Use `AskUserQuestion` to choose a release, skip migrations, or abort. Split the dynamic release list across wizard questions when needed. Use the menu below only without the tool.
+
 ```
 ApexYard /update: no .claude/framework-version anchor in this fork.
 This is normal on a fork created before framework v1.4.0.
@@ -768,6 +787,8 @@ If `--dry-run` is set, print the chain and exit before any `migration_run` invoc
 #### Per-step prompt
 
 For each pair in the chain, prompt:
+
+Use `AskUserQuestion` for apply, skip, show, or skip all. Recommend apply first. Use the prompt below only without the tool.
 
 ```
 Step N/M — <PAIR>
@@ -870,6 +891,8 @@ If `DRIFTED` is empty → skip this step entirely and continue to step 9.
 
 If non-empty, surface the drift with a y/n/d offer per project — same shape as the deprecated-config offer in step 8:
 
+Use `AskUserQuestion` for the per-project and per-file choices. Recommend keeping each project file first. Use the prompts below only without the tool.
+
 ```
 Topology drift detected — N projects are behind the framework's topology bundle:
 
@@ -947,6 +970,25 @@ write always happens through this explicit `/update` step (or a manual
 `bin/sync-codex-adapter.sh --reconcile-installed` run); `/update` remains the
 sole owner of strict, mutating reconciliation.
 
+### 8e. Record origin public proof for leak-hook exemption (#1477)
+
+After the sync has applied, refresh offline origin proof while network access
+is still available. The staged and runtime leak hooks never call GitHub.
+They read `leak_protection.origin_verified_public` from
+`.claude/project-config.json` (AgDR-0190).
+
+```bash
+bash bin/record-origin-verified-public.sh
+```
+
+The helper reads the origin slug, runs
+`gh repo view <slug> --json visibility,isFork`, and writes the key only when
+visibility is `PUBLIC`. If GitHub reports the repo is not `PUBLIC`, it removes
+an earlier key, because that proof is now wrong. If the check itself fails, it
+keeps an earlier matching key and writes no new one. It prints why in each case. Show that output
+to the operator. Do not stage the config file (#1031). Skip this step on
+`--dry-run`.
+
 ### 9. Final state + next steps
 
 On clean completion, print (substituting `$UPSTREAM_REF` for the literal `upstream/main` so the operator sees the actual ref synced under `--from-dev`):
@@ -1010,7 +1052,8 @@ Skill done. No remote state changed.
 | Merge conflict the user aborts | Restore original branch state, delete sync branch, exit 1 |
 | Tracking issue for the sync doesn't exist | Offer to create one via `gh issue create`, get number, continue |
 | `jq` not installed (deprecated-config detection) | Skip step 8 silently; print one-line warning. The sync itself still completes. |
-| `.claude/project-config.json` missing (no override) | Skip step 8 silently — by definition no deprecated keys to surface. |
+| `.claude/project-config.json` missing (no override) | Skip step 8 silently — by definition no deprecated keys to surface. Step 8e may still create the file when origin is PUBLIC. |
+| Origin is private during step 8e | Helper removes any earlier key, prints that origin exemption is off. Sync still succeeds. |
 | Operator answered `s` (show) | Print key + value, then re-prompt y/n (no `s` recursion). |
 | `--from-dev` passed but `upstream/dev` doesn't exist on the configured remote | Print: `upstream/dev not found — the configured upstream may not have a dev branch. Verify with: git ls-remote upstream dev`. Exit 1; no banner-suppression, no fallback to main. |
 | `--from-dev` combined with `--dry-run` | Banner prints first, then preview against `upstream/dev`, then exit 0. Same no-state-change semantics as plain `--dry-run`. |
@@ -1085,10 +1128,13 @@ The cost is **discipline at release-cut time**: skipping a release in the chain 
 ## Cleanup (REQUIRED before exit)
 
 ```bash
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-Always remove the bootstrap marker on a clean exit (after the sync branch is ready to push, or on a confirmed-abort during conflict resolution). If the skill is interrupted, `clear-bootstrap-marker.sh` clears the stale marker on the next session.
+Always remove the bootstrap marker on a clean exit (after the sync branch is ready to push, or on a confirmed-abort during conflict resolution). If the skill is interrupted, `clear-bootstrap-marker.sh` clears the marker when the same session restarts.
 
 ## Related
 

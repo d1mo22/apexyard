@@ -6,9 +6,7 @@ argument-hint: "<pr-number>"
 effort: low
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /approve-architecture — Record Per-PR Design-Review Approval
 
@@ -36,6 +34,33 @@ Valid invocation triggers:
 - Your own inference that "the design is probably fine." NO. Stop and ask.
 
 **If in doubt: STOP AND ASK.** "PR #X carries a technical design — has it been reviewed and approved against the architecture lens?" is one message. Building against an unsound design is much worse.
+
+## Menu path
+
+The typed command stays. The operator can also approve the architecture review from a menu.
+
+Show one `AskUserQuestion` menu. The question text must be exact.
+
+`Approve architecture review for <owner>/<repo>#<N> at <40-hex-sha>?`
+
+Use the PR base repo, the PR number, and the full head SHA from the forge. The SHA is 40 lowercase hex digits.
+
+Offer these options and no others.
+
+- `Approve architecture review`
+- `Not yet`
+
+Do not add a suffix to either label. The hook matches the label exactly.
+
+`record-menu-approval.sh` reads the harness payload. It writes the menu record when the selected option is `Approve architecture review`. Do not write the marker yourself.
+
+`Not yet` writes nothing.
+
+An umbrella "go" does not count. A prose answer does not count. Any answer outside this menu does not count.
+
+Tariq and the typed command still write a bare SHA. The menu record uses `skill_version=3` and `approval_channel=menu`. The gate accepts both. It still requires the recorded SHA to match the PR head.
+
+See AgDR-0234.
 
 ## Process
 
@@ -71,13 +96,8 @@ Architecture sign-off is a stamp on top of a Rex-approved HEAD (the design PR st
 
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel)
-OPS_ROOT=""
-r="$REPO_ROOT"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  if [ -f "$r/.apexyard-fork" ]; then OPS_ROOT="$r"; break; fi
-  if [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; then OPS_ROOT="$r"; break; fi
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+OPS_ROOT=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || OPS_ROOT=""
 MARKER_HOME="${OPS_ROOT:-$REPO_ROOT}"
 # shellcheck source=/dev/null
 . "$MARKER_HOME/.claude/hooks/_lib-review-markers.sh"

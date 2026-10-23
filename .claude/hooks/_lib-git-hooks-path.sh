@@ -119,19 +119,36 @@ fi
 # ------------------------------------------------------------------------
 ghp_classify() {
   local repo_root="$1" hooks_dir_name="$2"
-  local current current_resolved target_resolved
+  local current current_resolved target_resolved repo_cmp
 
-  current=$(git -C "$repo_root" config --get core.hooksPath 2>/dev/null || true)
-  target_resolved=$(_resolve_real_path "$repo_root/$hooks_dir_name")
+  # git rev-parse can print C:/... for a Temp directory.
+  # pwd -P prints /tmp/... for that same directory on Git Bash.
+  # _windows_path_to_posix uses cygpath -u when cygpath is present.
+  # That output follows the mount table. The string transform does not.
+  # A drive-letter hooks path is absolute.
+  # Joining it onto the repo makes an existing directory look missing.
+  # The installer then replaces it without --force.
+  repo_cmp="$repo_root"
+  if command -v _windows_path_to_posix >/dev/null 2>&1; then
+    repo_cmp=$(_windows_path_to_posix "$repo_root")
+  fi
+  # Read config from the converted root.
+  # Later checks compare that same path.
+  # git -C uses the mount path when cygpath returns one.
+  current=$(git -C "$repo_cmp" config --get core.hooksPath 2>/dev/null || true)
+  target_resolved=$(_resolve_real_path "$repo_cmp/$hooks_dir_name")
 
   if [ -z "$current" ]; then
     printf 'unset'
     return 0
   fi
 
+  if command -v _windows_path_to_posix >/dev/null 2>&1; then
+    current=$(_windows_path_to_posix "$current")
+  fi
   case "$current" in
     /*) current_resolved=$(_resolve_real_path "$current") ;;
-    *)  current_resolved=$(_resolve_real_path "$repo_root/$current") ;;
+    *)  current_resolved=$(_resolve_real_path "$repo_cmp/$current") ;;
   esac
 
   if [ -n "$current_resolved" ] && [ "$current_resolved" = "$target_resolved" ]; then
@@ -148,7 +165,7 @@ ghp_classify() {
   # real directory the adopter (or a script) deliberately created in this
   # very repo. Ambiguous-by-design: third-party, not stale.
   case "$current_resolved" in
-    "$repo_root"/*)
+    "$repo_cmp"/*)
       printf 'third-party:%s:%s' "$current" "$current_resolved"
       return 0
       ;;

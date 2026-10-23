@@ -1,17 +1,35 @@
 #!/bin/bash
-# Smoke tests for .claude/hooks/pre-push-gate.sh
+# Smoke tests for .claude/hooks/pre-push-gate.sh — the advisory-only
+# rewrite from me2resh/apexyard#1366 / AgDR-0173.
+#
+# The pre-#1366 version of this hook read a `.pre_push.commands` list and
+# ran it with `bash -c`. PR #1405's review found that any command-text
+# based target resolution could be fooled by read-only text that merely
+# MENTIONS a push — a heredoc body, a quoted separator, a commit message,
+# an echo (Hakim's H1 finding, still reproducing on that PR's last
+# commit). This hook no longer runs ANY repository's commands, so there
+# is nothing left for that class of bug to exploit. The negative cases
+# below (H1-*) prove exactly that: even with a `.pre_push.commands` entry
+# configured to leave a marker file, none of the read-only shapes cause
+# the marker to appear.
 #
 # Each case:
 #   - sets up an isolated sandbox repo under $TMPDIR
-#   - seeds a project-config.json with a specific `.pre_push.commands` array
 #   - pipes a synthetic PreToolUse JSON blob into the hook
-#   - asserts exit code + stderr contents
+#   - asserts exit code + stderr contents + (H1 cases) absence of a
+#     side-effect marker file
 #
-# Exit 0 if all cases pass; exit 1 on first failure with a clear message.
+# Exit 0 if all cases pass. Report every failed case before exiting 1.
 
 set -u
 
-HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/pre-push-gate.sh"
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
+HOOK_SRC="${PRE_PUSH_GATE_HOOK_SRC:-$(cd "$(dirname "$0")/.." && pwd)/pre-push-gate.sh}"
+AGDR_SRC="${PRE_PUSH_GATE_AGDR_SRC:-$(cd "$(dirname "$0")/../../.." && pwd)/docs/agdr/AgDR-0173-git-native-pre-push-command-execution.md}"
 if [ ! -x "$HOOK_SRC" ]; then
   echo "FAIL: hook not found or not executable at $HOOK_SRC" >&2
   exit 1
@@ -22,39 +40,110 @@ FAIL=0
 FAILED_CASES=""
 
 # -- sandbox builder -----------------------------------------------------
+# make_sandbox <install_git_native> <fork_shape>
+#
+# Install advice requires a valid session pin to the sandbox fork. Cases
+# set their own pin or explicitly clear all session pin variables. This
+# keeps them independent of the session that runs the suite.
+#
+# install_git_native=1: core.hooksPath set to .githooks with a real,
+# executable stub pre-push file — the hook should stay silent regardless
+# of fork_shape.
+# fork_shape=fork: plant a `.apexyard-fork` marker at the sandbox root.
+# fork_shape=managed (default): no anchor in the sandbox's own tree.
 make_sandbox() {
+  local install_git_native="${1:-0}"
+  local fork_shape="${2:-managed}"
   local sb
   sb=$(mktemp -d)
-  (
+  # Keep git from walking into the surrounding worktree under test.
+  GIT_CEILING_DIRECTORIES="$sb"
+  export GIT_CEILING_DIRECTORIES
+  if ! (
     cd "$sb" || exit 1
-    git init -q
+    git init -q || exit 1
     git config user.email "test@example.com"
     git config user.name "test"
     touch onboarding.yaml
     git add onboarding.yaml
     git commit -q -m "init"
-  )
-  mkdir -p "$sb/.claude/hooks" "$sb/.claude/session"
+  ); then
+    echo "FAIL: git init failed for sandbox at $sb — stop" >&2
+    rm -rf "$sb"
+    # make_sandbox is often called inside $(...). A plain exit only ends that
+    # subshell and leaves callers with an empty path. Kill the test shell.
+    kill $$ >/dev/null 2>&1
+    exit 1
+  fi
+  mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/pre-push-gate.sh"
   chmod +x "$sb/.claude/hooks/pre-push-gate.sh"
 
-  # Copy the shared reader + shipped defaults so config lookups resolve
-  # the same way they do in a real fork (same pattern as #115 test harness).
+  # Marker file used by the H1 cases below to prove NO command ran. A real
+  # .pre_push.commands entry that would leave this marker if it ever ran.
   local src_root
   src_root=$(cd "$(dirname "$0")/../../.." && pwd)
   if [ -f "$src_root/.claude/hooks/_lib-read-config.sh" ]; then
     cp "$src_root/.claude/hooks/_lib-read-config.sh" "$sb/.claude/hooks/_lib-read-config.sh"
   fi
+  if [ -f "$src_root/.claude/hooks/_lib-ops-root.sh" ]; then
+    cp "$src_root/.claude/hooks/_lib-ops-root.sh" "$sb/.claude/hooks/_lib-ops-root.sh"
+  fi
   if [ -f "$src_root/.claude/project-config.defaults.json" ]; then
     cp "$src_root/.claude/project-config.defaults.json" "$sb/.claude/project-config.defaults.json"
   fi
-  echo "$sb"
+  cat > "$sb/.claude/project-config.json" <<EOF
+{"pre_push": {"commands": [{"name": "leave-marker", "run": "touch '$sb/MARKER_RAN'"}]}}
+EOF
+
+  case "$fork_shape" in
+    fork)
+      touch "$sb/.apexyard-fork"
+      ;;
+    managed | *) ;;
+  esac
+
+  if [ "$install_git_native" = "1" ]; then
+    mkdir -p "$sb/.githooks"
+    printf '#!/bin/bash\nexit 0\n' > "$sb/.githooks/pre-push"
+    chmod +x "$sb/.githooks/pre-push"
+    (cd "$sb" && git config core.hooksPath .githooks)
+  fi
+
+  (cd "$sb" && pwd -P)
 }
 
 push_json() {
   cat <<EOF
 {"tool_input":{"command":"git push origin HEAD"}}
 EOF
+}
+
+make_pin() {
+  local root="$1" sid="$2" pin_dir
+  pin_dir=$(mktemp -d)
+  printf '%s\n' "$root" > "$pin_dir/ops-root-${sid}"
+  printf '%s' "$pin_dir"
+}
+
+run_pinned_hook() {
+  local sb="$1" pin_dir="$2" sid="$3" hook_path="${4:-.claude/hooks/pre-push-gate.sh}"
+  (
+    cd "$sb" || exit 1
+    # Capture stderr while discarding stdout.
+    # shellcheck disable=SC2069
+    push_json | env -u APEXYARD_OPS_DISABLE_PIN \
+      CLAUDE_CODE_SESSION_ID="$sid" APEXYARD_OPS_PIN_DIR="$pin_dir" \
+      bash "$hook_path" 2>&1 1>/dev/null
+  )
+}
+
+json_cmd() {
+  # Build a {"tool_input":{"command": <cmd>}} payload with jq -n so the
+  # command text is safely quoted regardless of what it contains
+  # (quotes, newlines, backslashes) — the exact classes of text the
+  # ORIGINAL hook mis-parsed. See #1405 review, finding B3.
+  jq -n --arg c "$1" '{tool_input:{command:$c}}'
 }
 
 run_hook() {
@@ -65,7 +154,7 @@ run_hook() {
   local label="$5"
   (
     cd "$sb" || exit 1
-    echo "$stdin_payload" | bash .claude/hooks/pre-push-gate.sh 2>/tmp/pre-push-gate-stderr.$$
+    echo "$stdin_payload" | env -u CLAUDE_CODE_SESSION_ID -u APEXYARD_OPS_PIN_DIR -u APEXYARD_OPS_DISABLE_PIN bash .claude/hooks/pre-push-gate.sh 2>/tmp/pre-push-gate-stderr.$$
   )
   local got_rc=$?
   local got_stderr
@@ -89,10 +178,22 @@ run_hook() {
   PASS=$((PASS+1))
 }
 
+assert_no_marker() {
+  local sb="$1" label="$2"
+  if [ -f "$sb/MARKER_RAN" ]; then
+    echo "FAIL [$label]: MARKER_RAN exists — a repository command ran" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}${label} "
+  else
+    echo "PASS [$label]"
+    PASS=$((PASS+1))
+  fi
+}
+
 # -------------------- CASE 1: non-git-push command --------------------
 case1() {
   local sb; sb=$(make_sandbox)
-  echo '{"tool_input":{"command":"ls -la"}}' | (cd "$sb" && bash .claude/hooks/pre-push-gate.sh 2>/dev/null)
+  echo '{"tool_input":{"command":"ls -la"}}' | (cd "$sb" && env -u CLAUDE_CODE_SESSION_ID -u APEXYARD_OPS_PIN_DIR -u APEXYARD_OPS_DISABLE_PIN bash .claude/hooks/pre-push-gate.sh 2>/dev/null)
   local rc=$?
   if [ "$rc" = "0" ]; then
     echo "PASS [non-git-push-silent]"
@@ -104,164 +205,365 @@ case1() {
   rm -rf "$sb"
 }
 
-# -------------------- CASE 2: empty commands → no-op --------------------
+# ---- CASE 2: pinned fork, no git-native hook -> full install advice ----
 case2() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": []}}
-EOF
-  run_hook "$sb" "$(push_json)" 0 "" "empty-commands-noop"
-  rm -rf "$sb"
+  local sb; sb=$(make_sandbox 0 fork)
+  local sid="test-session-fork" pin_dir out rc
+  pin_dir=$(make_pin "$sb" "$sid")
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "core.hooksPath" && echo "$out" | grep -qF "$sb"; then
+    echo "PASS [pinned-fork-gets-install-advice-and-names-repo]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [pinned-fork-gets-install-advice-and-names-repo]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pinned-fork-gets-install-advice-and-names-repo "
+  fi
+  assert_no_marker "$sb" "pinned-fork-advice-runs-no-commands"
+  rm -rf "$sb" "$pin_dir"
 }
 
-# -------------------- CASE 3: passing command --------------------
+# ---- CASE 3: git push, git-native hook installed -> silent, no reminder ----
+# fork_shape does not matter once the hook is actually installed.
 case3() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "echo-ok", "run": "true"}]}}
-EOF
-  run_hook "$sb" "$(push_json)" 0 "" "passing-command"
+  local sb; sb=$(make_sandbox 1 fork)
+  local out rc
+  out=$(cd "$sb" && echo "$(push_json)" | env -u CLAUDE_CODE_SESSION_ID -u APEXYARD_OPS_PIN_DIR -u APEXYARD_OPS_DISABLE_PIN bash .claude/hooks/pre-push-gate.sh 2>&1 1>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && [ -z "$out" ]; then
+    echo "PASS [git-native-hook-installed-silent]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [git-native-hook-installed-silent]: want rc=0 and empty stderr, got rc=$rc stderr='$out'" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}git-native-hook-installed-silent "
+  fi
+  assert_no_marker "$sb" "git-native-hook-installed: still runs no commands"
   rm -rf "$sb"
 }
 
-# -------------------- CASE 4: failing command --------------------
+# ---- CASE 4: fork, core.hooksPath set but the target file is missing ----
+# (e.g. .githooks/ dir removed after the config was set) -> install advice
+# still printed, since the git-native layer will not actually run.
 case4() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "deliberate-fail", "run": "echo oops; exit 1"}]}}
-EOF
-  run_hook "$sb" "$(push_json)" 2 "deliberate-fail: FAILED" "failing-command-blocks"
+  local sb; sb=$(make_sandbox 0 fork)
+  (cd "$sb" && git config core.hooksPath .githooks)
+  local sid="test-session-missing-hook" pin_dir out rc
+  pin_dir=$(make_pin "$sb" "$sid")
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "core.hooksPath"; then
+    echo "PASS [pinned-fork-hookspath-set-but-file-missing-still-advises]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [pinned-fork-hookspath-set-but-file-missing-still-advises]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pinned-fork-hookspath-set-but-file-missing-still-advises "
+  fi
+  rm -rf "$sb" "$pin_dir"
+}
+
+# ---- #1491: an unpinned or stale-pinned fork gets no install advice ----
+case_no_valid_pin_gets_no_advice() {
+  local sb; sb=$(make_sandbox 0 fork)
+  local out rc sid="test-session-stale" pin_dir
+
+  out=$(cd "$sb" && push_json | env -u CLAUDE_CODE_SESSION_ID \
+    -u APEXYARD_OPS_PIN_DIR -u APEXYARD_OPS_DISABLE_PIN \
+    bash .claude/hooks/pre-push-gate.sh 2>&1 1>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && ! echo "$out" | grep -qF "core.hooksPath"; then
+    echo "PASS [no-pin-gives-no-install-advice]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [no-pin-gives-no-install-advice]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}no-pin-gives-no-install-advice "
+  fi
+
+  pin_dir=$(make_pin "$sb/missing-root" "$sid")
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  if [ "$rc" = "0" ] && ! echo "$out" | grep -qF "core.hooksPath"; then
+    echo "PASS [stale-pin-gives-no-install-advice]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [stale-pin-gives-no-install-advice]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}stale-pin-gives-no-install-advice "
+  fi
+
+  rm -rf "$pin_dir"
+  pin_dir=$(make_pin "$sb" "$sid")
+  out=$(cd "$sb" && push_json | env CLAUDE_CODE_SESSION_ID="$sid" \
+    APEXYARD_OPS_PIN_DIR="$pin_dir" APEXYARD_OPS_DISABLE_PIN=1 \
+    bash .claude/hooks/pre-push-gate.sh 2>&1 1>/dev/null)
+  rc=$?
+  if [ "$rc" = "0" ] && ! echo "$out" | grep -qF "core.hooksPath"; then
+    echo "PASS [disabled-pin-gives-no-install-advice]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [disabled-pin-gives-no-install-advice]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}disabled-pin-gives-no-install-advice "
+  fi
+  rm -rf "$sb" "$pin_dir"
+}
+
+# ---- #1491: a pinned linked worktree resolves to its main checkout ----
+case_pinned_linked_worktree_gets_advice() {
+  local sb; sb=$(make_sandbox 0 fork)
+  local linked; linked=$(mktemp -d)
+  GIT_CEILING_DIRECTORIES="$sb:$linked"
+  export GIT_CEILING_DIRECTORIES
+  if ! git -C "$sb" worktree add -q -b linked "$linked"; then
+    echo "FAIL [pinned-linked-worktree-setup]" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pinned-linked-worktree-setup "
+    rm -rf "$sb" "$linked"
+    return
+  fi
+
+  local sid="test-session-linked" pin_dir out rc
+  pin_dir=$(make_pin "$sb" "$sid")
+  out=$(run_pinned_hook "$linked" "$pin_dir" "$sid" "$sb/.claude/hooks/pre-push-gate.sh")
+  rc=$?
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "core.hooksPath" &&
+    ! echo "$out" | grep -qF "not an ApexYard fork"; then
+    echo "PASS [pinned-linked-worktree-gets-advice-without-false-note]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [pinned-linked-worktree-gets-advice-without-false-note]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pinned-linked-worktree-gets-advice-without-false-note "
+  fi
+  rm -rf "$sb" "$linked" "$pin_dir"
+}
+
+# ---- #1504: a pin written through a symlink to the real fork gets advice ----
+case_symlinked_pin_gets_install_advice() {
+  local sb; sb=$(make_sandbox 0 fork)
+  local link_parent linked sid="test-session-symlink-pin" pin_dir out rc
+  link_parent=$(mktemp -d)
+  linked="$link_parent/fork-link"
+  ln -s "$sb" "$linked"
+
+  pin_dir=$(make_pin "$linked" "$sid")
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "core.hooksPath" &&
+    ! echo "$out" | grep -qF "not an ApexYard fork"; then
+    echo "PASS [symlinked-pin-gets-install-advice]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [symlinked-pin-gets-install-advice]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}symlinked-pin-gets-install-advice "
+  fi
+  rm -rf "$sb" "$link_parent" "$pin_dir"
+}
+
+# ---- #1504: a pin to a different repository still gets no install advice ----
+case_pin_to_different_repo_gets_no_advice() {
+  local sb; sb=$(make_sandbox 0 managed)
+  local other; other=$(make_sandbox 0 fork)
+  local sid="test-session-other-pin" pin_dir out rc
+  pin_dir=$(make_pin "$other" "$sid")
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  if [ "$rc" = "0" ] && ! echo "$out" | grep -qF "core.hooksPath"; then
+    echo "PASS [pin-to-different-repo-gets-no-install-advice]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [pin-to-different-repo-gets-no-install-advice]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pin-to-different-repo-gets-no-install-advice "
+  fi
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "not an ApexYard fork"; then
+    echo "PASS [pin-to-different-repo-gets-scope-note]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [pin-to-different-repo-gets-scope-note]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}pin-to-different-repo-gets-scope-note "
+  fi
+  rm -rf "$sb" "$other" "$pin_dir"
+}
+
+case_agdr_states_pinned_limit() {
+  if grep -qF 'only for sessions with a valid pin' "$AGDR_SRC"; then
+    echo "PASS [AgDR-0173-states-pinned-session-limit]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [AgDR-0173-states-pinned-session-limit]" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}AgDR-0173-states-pinned-session-limit "
+  fi
+}
+
+# =====================================================================
+# B2 tests (PR #1428 review, Rex findings B2 and S1, Hakim finding A5 —
+# maintainer decision)
+#
+# ApexYard never suggests installing the git-native hook, or setting
+# core.hooksPath, outside the resolved ops root. AgDR-0115 already
+# forbids ApexYard from wiring core.hooksPath into a managed-project
+# clone — suggesting it here would point an operator at exactly that.
+# Fork status comes from `resolve_ops_root`, never from a file a repo
+# ships about itself (round 3 — round 2 trusted self-reported files,
+# which a managed clone could spoof).
+# =====================================================================
+
+# ---- B2-1: pinned session in a managed clone -> short note only ----
+case_b2_managed_clone_short_note() {
+  local sb; sb=$(make_sandbox 0 managed)
+  local real_root sid="test-session-managed" pin_dir
+  real_root=$(make_sandbox 0 fork)
+  pin_dir=$(make_pin "$real_root" "$sid")
+  local out rc
+  out=$(run_pinned_hook "$sb" "$pin_dir" "$sid")
+  rc=$?
+  assert_no_marker "$sb" "B2-managed-clone-gets-short-note: still runs no commands"
+  if [ "$rc" = "0" ] && echo "$out" | grep -qF "not an ApexYard fork"; then
+    echo "PASS [B2-managed-clone-gets-short-note]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [B2-managed-clone-gets-short-note]: rc=$rc stderr=$out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-managed-clone-gets-short-note "
+  fi
+  if echo "$out" | grep -qF "core.hooksPath"; then
+    echo "FAIL [B2-managed-clone-never-suggests-hookspath]: $out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-managed-clone-never-suggests-hookspath "
+  else
+    echo "PASS [B2-managed-clone-never-suggests-hookspath]"
+    PASS=$((PASS+1))
+  fi
+  if echo "$out" | grep -qF "install-git-hooks.sh"; then
+    echo "FAIL [B2-managed-clone-never-suggests-installer]: $out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-managed-clone-never-suggests-installer "
+  else
+    echo "PASS [B2-managed-clone-never-suggests-installer]"
+    PASS=$((PASS+1))
+  fi
+  # Rex B1: the note must name the repo it checked.
+  if echo "$out" | grep -qF "$sb"; then
+    echo "PASS [B2-managed-clone-note-names-its-own-repo]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [B2-managed-clone-note-names-its-own-repo]: $out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-managed-clone-note-names-its-own-repo "
+  fi
+  rm -rf "$sb" "$real_root" "$pin_dir"
+}
+
+# ---- B2-3 (Hakim A5 / Rex S1): a repo that SHIPS `.apexyard-fork` but is
+# NOT the resolved ops root gets no install advice. The hook must trust
+# `resolve_ops_root`'s pin over a marker the working-directory repo
+# reports about itself. Set up a real, pin-valid ops root elsewhere, pin
+# a session to it, and prove the spoofed sandbox — despite shipping its
+# own `.apexyard-fork` — gets only the managed-clone note.
+case_b2_spoofed_fork_marker_gets_no_advice() {
+  local sb; sb=$(make_sandbox 0 fork)
+
+  local real_root; real_root=$(mktemp -d)
+  touch "$real_root/.apexyard-fork"
+  mkdir -p "$real_root/.claude/hooks"
+
+  local pin_dir; pin_dir=$(mktemp -d)
+  local sid="test-session-spoof"
+  printf '%s\n' "$real_root" > "$pin_dir/ops-root-${sid}"
+
+  local out
+  out=$(cd "$sb" && echo "$(push_json)" | \
+    env -u APEXYARD_OPS_DISABLE_PIN CLAUDE_CODE_SESSION_ID="$sid" APEXYARD_OPS_PIN_DIR="$pin_dir" \
+    bash .claude/hooks/pre-push-gate.sh 2>&1 1>/dev/null)
+
+  if echo "$out" | grep -qF "core.hooksPath"; then
+    echo "FAIL [B2-spoofed-fork-marker-gets-no-hookspath-advice]: $out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-spoofed-fork-marker-gets-no-hookspath-advice "
+  else
+    echo "PASS [B2-spoofed-fork-marker-gets-no-hookspath-advice]"
+    PASS=$((PASS+1))
+  fi
+  if echo "$out" | grep -qF "not an ApexYard fork"; then
+    echo "PASS [B2-spoofed-fork-marker-gets-managed-clone-note]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [B2-spoofed-fork-marker-gets-managed-clone-note]: $out" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}B2-spoofed-fork-marker-gets-managed-clone-note "
+  fi
+  rm -rf "$sb" "$real_root" "$pin_dir"
+}
+
+# =====================================================================
+# H1 negative tests (me2resh/apexyard#1366 / PR #1405 review / AgDR-0173)
+#
+# Each case configures a REAL .pre_push.commands entry that would leave
+# MARKER_RAN if it ever executed, then feeds the hook a command whose TEXT
+# merely mentions "git push" without being one. The old hook (still on
+# `dev` as of this writing) ran the command list on every one of these —
+# see the fail-before proof in the PR evidence. This hook must not.
+# =====================================================================
+
+# ---- H1-1: heredoc body mentioning a push ----
+case_h1_heredoc() {
+  local sb; sb=$(make_sandbox 0)
+  local cmd
+  cmd=$(printf 'cat <<EOF\nsee git push origin main for details\nEOF\n')
+  run_hook "$sb" "$(json_cmd "$cmd")" 0 "" "H1-heredoc-body-does-not-run-commands"
+  assert_no_marker "$sb" "H1-heredoc-body-does-not-run-commands"
   rm -rf "$sb"
 }
 
-# -------------------- CASE 5: skip marker in HEAD commit --------------------
-case5() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "should-skip", "run": "exit 1"}]}}
-EOF
-  # Amend the HEAD commit message to include the skip marker.
-  (cd "$sb" && git commit --amend -q -m "init
-
-<!-- pre-push: skip -->")
-  run_hook "$sb" "$(push_json)" 0 "pre-push gate bypassed by skip marker" "skip-marker-bypasses"
+# ---- H1-2: quoted string mentioning a push ----
+case_h1_quoted_string() {
+  local sb; sb=$(make_sandbox 0)
+  local cmd='grep -n "git push origin main" some-file.txt'
+  run_hook "$sb" "$(json_cmd "$cmd")" 0 "" "H1-quoted-string-does-not-run-commands"
+  assert_no_marker "$sb" "H1-quoted-string-does-not-run-commands"
   rm -rf "$sb"
 }
 
-# -------------------- CASE 6: multiple commands, first fails --------------------
-case6() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [
-  {"name": "lint", "run": "exit 1"},
-  {"name": "test", "run": "true"}
-]}}
-EOF
-  run_hook "$sb" "$(push_json)" 2 "lint: FAILED" "fail-fast-on-first-red"
+# ---- H1-3: commit message mentioning a push ----
+case_h1_commit_message() {
+  local sb; sb=$(make_sandbox 0)
+  local cmd='git commit -m "docs: explain git push origin main in the runbook"'
+  run_hook "$sb" "$(json_cmd "$cmd")" 0 "" "H1-commit-message-does-not-run-commands"
+  assert_no_marker "$sb" "H1-commit-message-does-not-run-commands"
   rm -rf "$sb"
 }
 
-# -------------------- CASE 7: no config at all → no-op --------------------
-case7() {
-  local sb; sb=$(make_sandbox)
-  # No project-config.json at all; defaults ship with empty commands.
-  run_hook "$sb" "$(push_json)" 0 "" "no-config-noop"
+# ---- H1-4: echo mentioning a push ----
+case_h1_echo() {
+  local sb; sb=$(make_sandbox 0)
+  local cmd='echo "reminder: run git push origin main after review"'
+  run_hook "$sb" "$(json_cmd "$cmd")" 0 "" "H1-echo-does-not-run-commands"
+  assert_no_marker "$sb" "H1-echo-does-not-run-commands"
   rm -rf "$sb"
 }
 
-
-# -------------------- CASE 8: untracked bad markdown → no failure --------------------
-# Regression guard for #548: a markdownlint command driven by git ls-files must
-# NOT lint untracked files, so a lint-dirty untracked .md must not block the push.
-# The command string avoids \0 / null-delimiter JSON escapes (jq rejects \0);
-# filenames in sandboxes are space-free so plain xargs (newline-split) is safe here.
-case8() {
-  local sb; sb=$(make_sandbox)
-  # Configure markdownlint using git ls-files (the fixed command shape).
-  # shellcheck disable=SC2016
-  printf '%s\n' \
-    '{"pre_push": {"commands": [{"name": "markdownlint", "run": "command -v npx >/dev/null 2>&1 || { echo INFO; exit 0; }; md_files=$(git ls-files '"'"'*.md'"'"' 2>/dev/null); [ -z \"$md_files\" ] && { echo INFO_SKIP; exit 0; }; echo \"$md_files\" | xargs npx --yes markdownlint-cli2 2>&1"}]}}' \
-    > "$sb/.claude/project-config.json"
-  # Drop a lint-dirty untracked markdown file.
-  # Critically, this file is NOT `git add`-ed, so git ls-files will not see it.
-  mkdir -p "$sb/.claude/skills/external-skill"
-  printf '# Bad heading  \n- item without blank line\n' \
-    > "$sb/.claude/skills/external-skill/DOCS.md"
-  # Push must succeed: the untracked file must be invisible to markdownlint.
-  run_hook "$sb" "$(push_json)" 0 "" "untracked-bad-md-ignored"
-  rm -rf "$sb"
-}
-
-# -------------------- CASE 9: tracked bad markdown → failure --------------------
-# Regression guard for #548: a lint error in a TRACKED markdown file must still
-# block the push, so the fix does not weaken the gate for real content.
-# Same command shape as case8 (space-safe xargs without -0, valid JSON).
-case9() {
-  local sb; sb=$(make_sandbox)
-  # shellcheck disable=SC2016
-  printf '%s\n' \
-    '{"pre_push": {"commands": [{"name": "markdownlint", "run": "command -v npx >/dev/null 2>&1 || { echo INFO; exit 0; }; md_files=$(git ls-files '"'"'*.md'"'"' 2>/dev/null); [ -z \"$md_files\" ] && { echo INFO_SKIP; exit 0; }; echo \"$md_files\" | xargs npx --yes markdownlint-cli2 2>&1"}]}}' \
-    > "$sb/.claude/project-config.json"
-  # Create a lint-dirty markdown file and COMMIT it so git ls-files sees it.
-  # MD047 (files-end-with-single-newline) is reliably detectable without a
-  # markdownlint config: just omit the trailing newline.
-  printf '# README\nno-trailing-newline' > "$sb/README.md"
-  (cd "$sb" && git add README.md && git commit -q -m "chore: add bad README")
-  # Use a local npx stub so this gate test never depends on registry access or
-  # a package download. The test is about propagating a tracked lint failure,
-  # not about testing markdownlint-cli2 itself.
-  mkdir -p "$sb/bin"
-  cat > "$sb/bin/npx" <<'EOF'
-#!/bin/bash
-echo "MD047: Files should end with a single newline" >&2
-exit 1
-EOF
-  chmod +x "$sb/bin/npx"
-  PATH="$sb/bin:$PATH"
-  run_hook "$sb" "$(push_json)" 2 "markdownlint: FAILED" "tracked-bad-md-fails"
-  rm -rf "$sb"
-}
-
-# -------------------- CASE 10: marker MENTIONED in prose → does NOT bypass --------------------
-# Regression guard for #1097: the skip marker used to be grep-matched
-# unanchored, so a commit message that merely *discusses* the marker
-# (documentation, a review comment quoted verbatim, a revert body) matched
-# too and silently disabled every check. The match must be whole-line
-# (grep -x): a sentence that contains the marker string inline is NOT a
-# deliberate bypass, so the check must still run (and still block on a
-# failing command).
-case10() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "should-not-skip", "run": "echo oops; exit 1"}]}}
-EOF
-  # The marker appears INSIDE a sentence, not as its own line — this must
-  # NOT be treated as a deliberate bypass.
-  (cd "$sb" && git commit --amend -q -m "docs: explain the escape hatch
-
-This documents the <!-- pre-push: skip --> marker so contributors know
-it exists. It should not itself act as a bypass.")
-  run_hook "$sb" "$(push_json)" 2 "should-not-skip: FAILED" "marker-mentioned-in-prose-does-not-bypass"
-  rm -rf "$sb"
-}
-
-# -------------------- CASE 11: marker on its OWN LINE → still bypasses --------------------
-# The other direction of #1097's fix: a deliberate bypass — the marker as
-# a line by itself, exactly the shape the documented amend snippet emits —
-# must keep working after anchoring the match to -x.
-case11() {
-  local sb; sb=$(make_sandbox)
-  cat > "$sb/.claude/project-config.json" <<'EOF'
-{"pre_push": {"commands": [{"name": "should-skip", "run": "exit 1"}]}}
-EOF
-  (cd "$sb" && git commit --amend -q -m "fix: emergency hotfix
-
-<!-- pre-push: skip -->")
-  run_hook "$sb" "$(push_json)" 0 "pre-push gate bypassed by skip marker" "marker-own-line-still-bypasses"
-  rm -rf "$sb"
-}
-
-case1; case2; case3; case4; case5; case6; case7; case8; case9; case10; case11
+case1
+case2
+case3
+case4
+case_no_valid_pin_gets_no_advice
+case_pinned_linked_worktree_gets_advice
+case_symlinked_pin_gets_install_advice
+case_pin_to_different_repo_gets_no_advice
+case_agdr_states_pinned_limit
+case_h1_heredoc
+case_h1_quoted_string
+case_h1_commit_message
+case_h1_echo
+case_b2_managed_clone_short_note
+case_b2_spoofed_fork_marker_gets_no_advice
 
 echo ""
 echo "==================================="

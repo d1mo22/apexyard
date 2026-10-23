@@ -1,0 +1,78 @@
+name: ORBIT records lint
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  issues: read
+concurrency:
+  group: orbit-records-lint-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  records-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select records or slice PR
+        id: select
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          git checkout -B "$HEAD_REF" HEAD
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/orbit-pr-body"
+          if git diff --name-only "origin/$BASE_REF...HEAD" -- docs/orbit/ | grep -q . ||
+             grep -q 'ORBIT slice:' "$RUNNER_TEMP/orbit-pr-body"; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v5.0.0
+        if: steps.select.outputs.run == 'true'
+        with:
+          node-version: '22'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.select.outputs.run == 'true'
+        with:
+          repository: me2resh/orbit-spec
+          ref: 7a024046c7d65d28576a5b175978cd4f70ea91cc
+          path: .orbit-cli
+          persist-credentials: false
+      - name: Install ORBIT
+        if: steps.select.outputs.run == 'true'
+        working-directory: .orbit-cli
+        run: npm ci --ignore-scripts
+      - name: Read slice tickets
+        if: steps.select.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "slice-" --json title,body --limit 1000 |
+            jq -r '.[] | select((.title // "") | startswith("[Slice]")) | (.body // "") | scan("`(slice-[A-Za-z0-9._-]+)`") | .[0]' > "$RUNNER_TEMP/orbit-tickets"
+      - name: Lint records
+        if: steps.select.outputs.run == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Use this source for framework records.
+          upstream_slug='me2resh/apexyard'
+          upstream_args=()
+          if [ "$GITHUB_REPOSITORY" != "$upstream_slug" ]; then
+            if git fetch --no-tags "https://github.com/$upstream_slug.git" dev:refs/remotes/apexyard-upstream/dev; then
+              upstream_args=(--upstream refs/remotes/apexyard-upstream/dev)
+            else
+              echo '::warning::Cannot fetch upstream dev. Lint checks every changed record.'
+            fi
+          fi
+          wrapper="$RUNNER_TEMP/orbit"
+          printf '#!/usr/bin/env bash\nexec node "%s/.orbit-cli/bin/orbit.js" "$@"\n' "$GITHUB_WORKSPACE" > "$wrapper"
+          chmod +x "$wrapper"
+          export ORBIT_BIN="$wrapper"
+          bash .claude/skills/orbit/lib/records-lint.sh --orbit-root docs/orbit \
+            --base "origin/$BASE_REF" --pr "$PR_NUMBER" --pr-body "$RUNNER_TEMP/orbit-pr-body" \
+            --tickets "$RUNNER_TEMP/orbit-tickets" "${upstream_args[@]}"

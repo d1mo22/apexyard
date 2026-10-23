@@ -8,7 +8,13 @@
 #
 # Usage:
 #   bin/run-hook-tests.sh            # run the whole suite
+#   bin/run-hook-tests.sh --files /tmp/tests # explicit newline-separated list
 #   bin/run-hook-tests.sh --list     # list discovered tests, run nothing
+#   bin/run-hook-tests.sh --shard 1/4 # run one shard
+#   bin/hook-test-weights.txt supplies weights when present.
+#   HOOK_TEST_WEIGHTS_FILE overrides that path.
+#   A missing or empty file uses round-robin. Missing tests use weight 10.
+#   HOOK_TEST_SHARD=1 HOOK_TEST_SHARDS=4 bin/run-hook-tests.sh
 #
 # Quarantine: tests that genuinely cannot run headless (or are known-failing
 # and tracked for a fix) are listed in QUARANTINE below, each with a reason.
@@ -17,15 +23,61 @@
 
 set -uo pipefail
 
-# Test isolation (#528): many hooks resolve their ops-root via _lib-ops-root.sh,
-# which inside a live Claude Code session honours the session pin
-# ($APEXYARD_OPS_PIN_DIR/ops-root-$CLAUDE_CODE_SESSION_ID) and points at the REAL
-# fork — so a sandbox-based test would escape onto the real repo (wrong results,
-# and for writing hooks like apply-agent-routing / link-custom-skills, real-file
-# mutation). Disable the pin for the whole suite so every test resolves by
-# walk-up to its own sandbox. No-op in headless CI (no pin). Tests that
-# specifically exercise the pin (test_resolve_ops_root_pin.sh) set/unset this
-# per-case, so the suite-level default doesn't interfere.
+FILES=
+LIST=0
+SHARD=${HOOK_TEST_SHARD-}
+SHARDS=${HOOK_TEST_SHARDS-}
+shard_error() {
+  echo "Invalid shard: use --shard I/N or HOOK_TEST_SHARD=I HOOK_TEST_SHARDS=N (1 <= I <= N)." >&2
+  exit 2
+}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --files)
+      [ "$#" -ge 2 ] || { echo "--files requires a newline-separated test-list file" >&2; exit 2; }
+      FILES=$2
+      shift 2
+      ;;
+    --list) LIST=1; shift ;;
+    --shard)
+      [ "$#" -ge 2 ] || shard_error
+      case "$2" in */*) ;; *) shard_error ;; esac
+      SHARD=${2%%/*}
+      SHARDS=${2#*/}
+      shift 2
+      ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+if [ -n "$SHARD$SHARDS" ] || [ "${HOOK_TEST_SHARD+x}${HOOK_TEST_SHARDS+x}" != "" ]; then
+  case "$SHARD:$SHARDS" in *[!0-9:]*|:*|*:) shard_error ;; esac
+  # Strip leading zeroes before arithmetic (bash otherwise interprets octal).
+  SHARD=$(printf '%s' "$SHARD" | sed 's/^0*//')
+  SHARDS=$(printf '%s' "$SHARDS" | sed 's/^0*//')
+  [ -n "$SHARD" ] && [ -n "$SHARDS" ] || shard_error
+  # Keep arithmetic within the signed integer range on supported hosts.
+  [ "${#SHARD}" -le 18 ] && [ "${#SHARDS}" -le 18 ] || shard_error
+  [ "$SHARD" -le "$SHARDS" ] || shard_error
+else
+  SHARD=1
+  SHARDS=1
+fi
+START_SECONDS=$SECONDS
+
+# Test isolation (#528 + #1549): many hooks resolve their ops-root via
+# _lib-ops-root.sh, which inside a live Claude Code session honours the session
+# pin ($APEXYARD_OPS_PIN_DIR/ops-root-$CLAUDE_CODE_SESSION_ID) and points at the
+# REAL fork — so a sandbox-based test would escape onto the real repo (wrong
+# results, and for writing hooks like apply-agent-routing / link-custom-skills,
+# real-file mutation). Disable the pin for the whole suite so every test
+# resolves by walk-up to its own sandbox. No-op in headless CI (no pin). Tests
+# that specifically exercise the pin (test_resolve_ops_root_pin.sh) set/unset
+# this per-case, so the suite-level default doesn't interfere.
+#
+# #1549: also drop an inherited CLAUDE_CODE_SESSION_ID and redirect
+# APEXYARD_OPS_PIN_DIR to a fresh temp directory. Without that, pin-ops-root.sh
+# and resolve-cache writers overwrite the operator's real
+# ~/.claude/apexyard/ops-root-<session> and resolve-cache-<session>-* files.
 export APEXYARD_OPS_DISABLE_PIN=1
 
 # Same isolation rationale, for the session-scoped resolution cache added in
@@ -36,6 +88,18 @@ export APEXYARD_OPS_DISABLE_PIN=1
 # cache, or pollute it with sandbox values. Tests that specifically exercise
 # the cache (test_resolution_cache.sh) set/unset this per-case.
 export APEXYARD_DISABLE_RESOLUTION_CACHE=1
+
+unset CLAUDE_CODE_SESSION_ID
+SUITE_PIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/apexyard-hook-suite-pins.XXXXXX") || exit 1
+# Share one pin dir with suites that source _test-session-isolation.sh so a
+# full run does not leave ~N mktemp directories behind; remove on EXIT.
+export _APEXYARD_TEST_PIN_DIR="$SUITE_PIN_DIR"
+export APEXYARD_OPS_PIN_DIR="$SUITE_PIN_DIR"
+OUTPUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/apexyard-hook-suite-output.XXXXXX") || {
+  rm -rf "$SUITE_PIN_DIR"
+  exit 1
+}
+trap 'rm -rf "$SUITE_PIN_DIR" "$OUTPUT_DIR"' EXIT
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -48,6 +112,7 @@ QUARANTINE=(
   # skips from other suites.
   ".claude/hooks/tests/test_lib_self_location_cwd_anchor.sh :: requires a non-standard working-directory layout"
   ".claude/hooks/tests/test_portfolio_paths_case_insensitive_fs.sh :: requires a case-insensitive filesystem"
+  ".claude/hooks/tests/test_pre_push_gate_case_insensitive_fs.sh :: requires a case-insensitive filesystem"
   ".claude/hooks/tests/test_tracker_zsh_self_location.sh :: requires zsh"
   ".claude/skills/pdf/tests/test_md_to_pdf_fallback.sh :: requires opt-in PDF end-to-end dependencies"
 )
@@ -72,19 +137,83 @@ while IFS= read -r _t; do
   [ -n "$_t" ] && TESTS+=("$_t")
 done < <(
   find .claude/hooks/tests .claude/agents/tests .claude/skills \
-       -type f \( -name 'test_*.sh' -o -name '*.test.sh' \) 2>/dev/null | sort
+       -type f \( -name 'test_*.sh' -o -name '*.test.sh' \) 2>/dev/null | LC_ALL=C sort
 )
 
-if [ "${1:-}" = "--list" ]; then
+# Validate explicit selections against discovery; an empty list runs no tests.
+if [ -n "$FILES" ]; then
+  [ -r "$FILES" ] || { echo "Cannot read test list: $FILES" >&2; exit 2; }
+  REQUESTED=()
+  while IFS= read -r _t || [ -n "$_t" ]; do
+    [ -n "$_t" ] || continue
+    found=0
+    for candidate in ${TESTS[@]+"${TESTS[@]}"}; do
+      [ "$candidate" != "$_t" ] || found=1
+    done
+    [ "$found" -eq 1 ] || { echo "Unknown test: $_t" >&2; exit 2; }
+    REQUESTED+=("$_t")
+  done < "$FILES"
+  TESTS=(${REQUESTED[@]+"${REQUESTED[@]}"})
+fi
+
+SELECTED=()
+WEIGHTS_FILE=${HOOK_TEST_WEIGHTS_FILE:-$ROOT/bin/hook-test-weights.txt}
+WEIGHTED=0
+if [ "$SHARDS" -gt 1 ] && [ -s "$WEIGHTS_FILE" ]; then
+  # Sort by descending weight, then path. Assign ties to the first shard.
+  awk '
+    FILENAME == ARGV[1] {
+      if ($0 !~ /^[[:space:]]*(#|$)/ && $1 ~ /^[0-9]+$/ && $1 > 0 && NF == 2) {
+        weights[$2] = $1
+        valid = 1
+      }
+      next
+    }
+    { print (($0 in weights) ? weights[$0] : 10), $0 }
+    END { if (!valid) exit 1 }
+  ' "$WEIGHTS_FILE" <(printf '%s\n' ${TESTS[@]+"${TESTS[@]}"}) > "$OUTPUT_DIR/weights" && WEIGHTED=1
+fi
+if [ "$WEIGHTED" -eq 1 ]; then
+  while IFS= read -r _t; do
+    [ -n "$_t" ] && SELECTED+=("$_t")
+  done < <(
+    LC_ALL=C sort -k1,1nr -k2,2 "$OUTPUT_DIR/weights" |
+      awk -v shards="$SHARDS" -v selected="$SHARD" '
+        {
+          best = 1
+          for (i = 2; i <= shards; i++) {
+            if (total[i] + 0 < total[best] + 0) best = i
+          }
+          total[best] += $1
+          if (best == selected) print $2
+        }
+      ' | LC_ALL=C sort
+  )
+else
+  for ((k=0; k<${#TESTS[@]}; k++)); do
+    if [ "$((k % SHARDS))" -eq "$((SHARD - 1))" ]; then
+      SELECTED+=("${TESTS[$k]}")
+    fi
+  done
+fi
+# bash 3.2 treats an empty "${arr[@]}" as unbound under set -u.
+TESTS=(${SELECTED[@]+"${SELECTED[@]}"})
+
+if [ "$LIST" -eq 1 ]; then
   [ "${#TESTS[@]}" -gt 0 ] && printf '%s\n' "${TESTS[@]}"
   echo "(${#TESTS[@]} tests discovered)"
   exit 0
 fi
 
+printf 'hook tests: shard %s/%s, %s tests\n' "$SHARD" "$SHARDS" "${#TESTS[@]}"
+
 pass=0 fail=0 skip=0
 FAILED=()
 
-for t in "${TESTS[@]}"; do
+test_index=0
+for t in ${TESTS[@]+"${TESTS[@]}"}; do
+  output="$OUTPUT_DIR/$test_index.out"
+  test_index=$((test_index+1))
   if is_quarantined "$t"; then
     reason=""
     for entry in "${QUARANTINE[@]}"; do
@@ -94,11 +223,19 @@ for t in "${TESTS[@]}"; do
     skip=$((skip+1))
     continue
   fi
+  # Force isolation even when a suite forgets to source
+  # _test-session-isolation.sh (me2resh/apexyard#1549).
+  # Pass _APEXYARD_TEST_PIN_DIR so the helper reuses SUITE_PIN_DIR.
   # shellcheck disable=SC2086
-  if $TIMEOUT_BIN bash "$t" </dev/null >/tmp/_hooktest.out 2>&1; then
-    if grep -q '^SKIP' /tmp/_hooktest.out; then
+  if env -u CLAUDE_CODE_SESSION_ID \
+      APEXYARD_OPS_DISABLE_PIN=1 \
+      APEXYARD_DISABLE_RESOLUTION_CACHE=1 \
+      APEXYARD_OPS_PIN_DIR="$SUITE_PIN_DIR" \
+      _APEXYARD_TEST_PIN_DIR="$SUITE_PIN_DIR" \
+      $TIMEOUT_BIN bash "$t" </dev/null >"$output" 2>&1; then
+    if grep -q '^SKIP' "$output"; then
       printf '  diagnostics from %s:\n' "$t"
-      grep '^SKIP' /tmp/_hooktest.out | sed 's/^/    /'
+      grep '^SKIP' "$output" | sed 's/^/    /'
       skip=$((skip+1))
       printf 'FAIL %s  (suite reported a skipped case)\n' "$t"
       fail=$((fail+1))
@@ -110,7 +247,7 @@ for t in "${TESTS[@]}"; do
   else
     rc=$?
     printf 'FAIL %s  (rc=%s)\n' "$t" "$rc"
-    tail -n 15 /tmp/_hooktest.out | sed 's/^/      | /'
+    tail -n 15 "$output" | sed 's/^/      | /'
     fail=$((fail+1))
     FAILED+=("$t")
   fi
@@ -120,6 +257,7 @@ echo
 echo "============================================================"
 echo "  hook test suite: PASS=$pass  FAIL=$fail  SKIP(quarantined)=$skip  TOTAL=${#TESTS[@]}"
 echo "============================================================"
+printf 'Wall-clock: %s seconds\n' "$((SECONDS - START_SECONDS))"
 if [ "$fail" -gt 0 ]; then
   printf 'FAILED:\n'; printf '  - %s\n' "${FAILED[@]}"
   exit 1

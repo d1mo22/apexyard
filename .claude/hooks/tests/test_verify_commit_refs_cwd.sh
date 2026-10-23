@@ -7,8 +7,8 @@
 # means both commands used the HOOK PROCESS'S OWN cwd — not the directory
 # the `git commit` is actually executing in. In a split-portfolio /
 # worktree-based sub-agent session, the harness's Bash cwd for that call
-# (the payload `.cwd` field, same field suggest-mcp-reindex-after-pull.sh
-# already reads) can be a managed project's worktree while the hook process
+# (the payload `.cwd` field, which other PostToolUse hooks also read)
+# can be a managed project's worktree while the hook process
 # itself is invoked from the ops fork. The hook then validated `Closes #N`
 # against the OPS FORK's tracker instead of the PROJECT's, false-blocking a
 # legitimate reference.
@@ -74,6 +74,11 @@
 # deliberately the "wrong" sandbox.
 
 set -u
+
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
 
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/verify-commit-refs.sh"
 # shellcheck source=_lib-mock-gh.sh
@@ -394,10 +399,10 @@ assert_case() {
   rm -rf "$base" "$spacey" "$ops"
 }
 
-# ---- Case 10: a RELATIVE cd path must not be trusted (round-2 hijack, ----
-# ---- row 5) — only absolute scraped paths are honored; a relative one ----
-# ---- falls through to the hook's own cwd rather than an ambiguous     ----
-# ---- resolution against an unknown base.                              ----
+# ---- Case 10: a RELATIVE cd path is never resolved against a guessed  ----
+# ---- base (round-2 hijack, row 5). Since #1739 the shared lib resolves ----
+# ---- it against the payload cwd or the hook's cwd. A missing target    ----
+# ---- blocks. It does not fall back to the hook's own repo.            ----
 {
   ops=$(make_repo "managed-org/example")
   mock_gh_install "$ops"
@@ -406,8 +411,8 @@ assert_case() {
   cmd=$(build_command 'fix: relative cd is not trusted\n\nCloses #510' "cd ../some-sibling && ")
   out=$(run_hook "$ops" "" "$cmd")
   rc=$?
-  assert_case "a relative cd path is not trusted; falls back to the hook's own cwd" \
-    "$out" "$rc" 0 ""
+  assert_case "a relative cd path to a missing dir blocks; no fallback to the hook's own repo" \
+    "$out" "$rc" 2 "cannot resolve"
   rm -rf "$ops"
 }
 

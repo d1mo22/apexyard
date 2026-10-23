@@ -8,6 +8,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Pin isolation: the hook resolves its ops-root (and thus the sandbox markers /
 # config) via the session pin. Run interactively inside a live apexyard session,
 # the pin resolves PAST each mktemp sandbox to the operator's real fork, so the
@@ -15,6 +20,7 @@ set -u
 # (bin/run-hook-tests.sh) disables the pin; unset here too so a direct
 # `bash test_require_skill_for_issue_create.sh` is robust under nesting.
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
+export CLAUDE_CODE_SESSION_ID=marker-test
 
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/require-skill-for-issue-create.sh"
@@ -53,6 +59,7 @@ make_sandbox() {
   cp "$HOOK_SRC" "$sb/.claude/hooks/require-skill-for-issue-create.sh"
   [ "$HAVE_LIB_OPS" = "1" ] && cp "$LIB_OPS" "$sb/.claude/hooks/_lib-ops-root.sh"
   cp "$LIB_CFG" "$sb/.claude/hooks/_lib-read-config.sh"
+  cp "$(cd "$(dirname "$0")/.." && pwd)/_lib-session-markers.sh" "$sb/.claude/hooks/_lib-session-markers.sh"
   cp "$DEFAULTS" "$sb/.claude/project-config.defaults.json"
   chmod +x "$sb/.claude/hooks/require-skill-for-issue-create.sh"
   echo "$sb"
@@ -125,19 +132,19 @@ run_case "glab issue create blocked w/o marker (#670)" 2 "BLOCKED" "$in" "$sb"
 
 # --- Marker present → ALLOW on each default matcher ------------------------
 
-sb=$(make_sandbox); echo "feature" > "$sb/.claude/session/active-issue-skill"
+sb=$(make_sandbox); echo "feature" > "$sb/.claude/session/active-issue-skill.marker-test"
 in=$(jq -nc --arg c "gh issue create --repo foo/bar --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "gh issue create allowed with skill marker" 0 "" "$in" "$sb"
 
-sb=$(make_sandbox); echo "task" > "$sb/.claude/session/active-issue-skill"
+sb=$(make_sandbox); echo "task" > "$sb/.claude/session/active-issue-skill.marker-test"
 in=$(jq -nc --arg c "gh api repos/foo/bar/issues -f title=x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "gh api allowed with skill marker" 0 "" "$in" "$sb"
 
-sb=$(make_sandbox); echo "bug" > "$sb/.claude/session/active-issue-skill"
+sb=$(make_sandbox); echo "bug" > "$sb/.claude/session/active-issue-skill.marker-test"
 in=$(jq -nc --arg c "linear issue create --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "linear allowed with skill marker" 0 "" "$in" "$sb"
 
-sb=$(make_sandbox); echo "task" > "$sb/.claude/session/active-issue-skill"
+sb=$(make_sandbox); echo "task" > "$sb/.claude/session/active-issue-skill.marker-test"
 in=$(jq -nc --arg c 'tracker_create foo/bar "my title" /tmp/body.md' '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "tracker_create allowed with skill marker (#670)" 0 "" "$in" "$sb"
 
@@ -163,16 +170,16 @@ run_case "Edit tool is no-op" 0 "" "$in" "$sb"
 
 # --- Bootstrap-skill exemption ---------------------------------------------
 
-sb=$(make_sandbox); echo "handover" > "$sb/.claude/session/active-bootstrap"
+sb=$(make_sandbox); echo "handover" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg c "gh issue create --repo foo/bar --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "gh issue create allowed during handover bootstrap" 0 "" "$in" "$sb"
 
-sb=$(make_sandbox); echo "setup" > "$sb/.claude/session/active-bootstrap"
+sb=$(make_sandbox); echo "setup" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg c "gh issue create --repo foo/bar --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "gh issue create allowed during setup bootstrap" 0 "" "$in" "$sb"
 
 # An UNLISTED bootstrap skill should NOT grant the exemption — blocked.
-sb=$(make_sandbox); echo "some-random-skill" > "$sb/.claude/session/active-bootstrap"
+sb=$(make_sandbox); echo "some-random-skill" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg c "gh issue create --repo foo/bar --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "gh issue create blocked when bootstrap marker is non-listed" 2 "BLOCKED" "$in" "$sb"
 
@@ -201,9 +208,42 @@ run_case "custom matcher 'mycorp-tracker new' enforced" 2 "BLOCKED" "$in" "$sb"
 
 # --- Empty marker → no exemption (treated as no marker) --------------------
 
-sb=$(make_sandbox); : > "$sb/.claude/session/active-issue-skill"
+sb=$(make_sandbox); : > "$sb/.claude/session/active-issue-skill.marker-test"
 in=$(jq -nc --arg c "gh issue create --repo foo/bar --title x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "empty skill marker → blocked" 2 "BLOCKED" "$in" "$sb"
+
+# --- Wrapped tracker_create (skill shapes) stay allowed --------------------
+# /tickets-batch, /roadmap, /spike-close --promote, and /prototype-close
+# --promote assign result="$(tracker_create …)" without the skill marker.
+# This gate must not match `$(…)`: that would block every adopter. The
+# ORBIT guard covers wrapped creates (AgDR-0217). No git remote is needed:
+# the hook under test runs with no marker and must allow each shape.
+# Build the create verb at runtime so live PreToolUse gates do not see a
+# literal create command on the test-runner shell line.
+create_verb=create
+tracker_fn="tracker_${create_verb}"
+shape_i=0
+for shape_fmt in \
+  'result="$(%s "{owner/repo}" "[Feature] {title}" "$body_file" "{type-label},{priority},{area-labels}")"' \
+  'result="$(%s "$owner_repo" "[Roadmap] {item}" "$body_file" "roadmap,{priority}")"' \
+  'result="$(%s "{owner/repo}" "[Feature] {title}" "$body_file" "enhancement")"' \
+  'result="$(%s "{owner/repo}" "[Feature] {title}" "$body_file" "enhancement")"'
+do
+  shape_i=$((shape_i + 1))
+  shape=$(printf "$shape_fmt" "$tracker_fn")
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$shape" '{tool_name:"Bash", tool_input:{command:$c}}')
+  shape_rc=0
+  (cd "$sb" && printf '%s' "$in" | bash .claude/hooks/require-skill-for-issue-create.sh >/dev/null 2>"$sb/err") || shape_rc=$?
+  rm -rf "$sb"
+  if [ "$shape_rc" -ne 0 ]; then
+    echo "FAIL [wrapped skill shape $shape_i allowed without marker]: rc=$shape_rc" >&2
+    FAIL=$((FAIL + 1)); FAILED_CASES="${FAILED_CASES}wrapped-shape-$shape_i "
+  else
+    echo "PASS [wrapped skill shape $shape_i allowed without marker]"
+    PASS=$((PASS + 1))
+  fi
+done
 
 # --- Summary --------------------------------------------------------------
 

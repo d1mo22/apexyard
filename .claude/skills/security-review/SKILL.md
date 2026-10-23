@@ -6,9 +6,7 @@ argument-hint: "<pr-number> [repo]"
 allowed-tools: Bash, Read, Grep, Glob
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /security-review — Security Review
 
@@ -49,9 +47,30 @@ Invoke for PRs that touch:
 - Third-party integrations
 - Cryptography or secrets
 
+## Review bar for gate PRs (me2resh/apexyard#1845, AgDR-0267)
+
+The shell-text gates are guardrails against honest mistakes, not a security boundary. Hakim applies this bar:
+
+The bar narrows one case only. On a PR that changes `.claude/hooks/**`, a crafted command that the shell-text scan does not catch is advisory. This case includes an exotic shape that `dev` blocks and the head does not.
+
+Every other blocker stays:
+
+- kinds 1, 3 and 4 of the Blocking-Severity Bar (AgDR-0172)
+- a gate that fails open on its own error, timeout or bad input
+- a hook change that runs code from command text, a cloned repository or other untrusted input
+- the checks that `.claude/agents/code-reviewer.md` § "Blocking-Severity Bar" keeps blocking. These are the Acceptance Criteria check, the AgDR check, the Glossary requirement, a handbook marked `ENFORCEMENT: blocking`, and rail 1 of `.claude/rules/right-size-ceremony.md`.
+
+A regression on an ordinary command is kind 1. An ordinary command is one that an agent or a human really types. A false block counts. A slowdown above the 2 s target in AgDR-0267 § "Cost budget" counts when `dev` is below it.
+
+A deleted or weakened paired test for a shape that `dev` already blocks is a correctness finding (kind 3).
+
+An exotic bypass shape is advisory. Name its class only, never the exact command. List the class for epic me2resh/apexyard#1846. Do not hunt for new shape classes. Check the delta, the earlier findings, and ordinary commands against `dev`.
+
+The orchestrator adds each listed class to the epic. The full bar is in `.claude/agents/security-reviewer.md` § "Review bar for gate PRs" and in [AgDR-0267](../../../docs/agdr/AgDR-0267-shell-text-gates-are-guardrails.md).
+
 ## Running tests in a scratch clone
 
-Hakim may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export the PR head with `git archive | tar -x` into a literal non-git directory. The export step still needs an active session ticket. A later write to a literal path inside that directory can use the me2resh/apexyard#883 exemption. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/security-reviewer.md` § "Running tests in a scratch clone".
+Hakim may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export with `git archive <ref> | tar -x -C <scratchpad>` into this session's scratchpad. A sanctioned review needs no ticket for that write. The agent file states the path rule. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/security-reviewer.md` § "Running tests in a scratch clone".
 
 The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` while the active-reviewer marker exists. Prepare the scratch clone and fetch the PR head before step 0 arms the marker.
 
@@ -62,15 +81,10 @@ The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` w
 Before spawning the Security Reviewer agent, write the active-reviewer session marker. It records that this review pass is the sanctioned one and suppresses `warn-review-marker-write.sh`'s advisory warning on the `*-security.approved` write (same convention as `/code-review`'s rex marker; that hook warns and never blocks since #1026 — AgDR-0111). The marker is scoped to THIS Claude Code session (me2resh/apexyard#1376) — resolve its path through `active_reviewer_marker_path`, never write the bare `.claude/session/active-reviewer` path directly. At skill entry:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "security")
 mkdir -p "$(dirname "$active_marker")"
 printf '%s\n' "<owner/repo>#<pr>:security" > "$active_marker"
 ```
@@ -78,17 +92,14 @@ printf '%s\n' "<owner/repo>#<pr>:security" > "$active_marker"
 On skill exit (after the review is posted), clear the marker. Shell variables do not persist across separate Bash tool calls, so the exit step re-resolves `ops_root` and `active_marker` from scratch — it does not reuse the step-0 variable, which would silently be empty in a later call and turn the `rm -f` into a no-op:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "security")
 rm -f "$active_marker"
 ```
+
+The marker is keyed on session, repo, PR and review kind (me2resh/apexyard#1649). Each review writes and clears only its own file, so reviews run at the same time. The mutation lock applies to review agents only; the orchestrator and build agents can keep working. Use the same `<owner/repo>`, `<pr>` and kind in the write step and the exit step. Spawn the reviewer with the Agent tool and `subagent_type: security-reviewer`. Never use `general-purpose`: the lock finds a review agent by that type.
 
 Nothing mechanically stops a build-class sub-agent writing the same file; what makes this marker legitimate is that a real, independent review happened. See `.claude/hooks/warn-review-marker-write.sh` and `.claude/rules/pr-workflow.md` § "Build agents cannot self-review".
 
@@ -176,6 +187,8 @@ Posts a GitHub review with:
 - Verdict
 
 Invokes: Security Reviewer Agent (Hakim)
+
+**Review body path (#1840, AgDR-0266).** Hakim writes the review body with the Write tool to the sanctioned body path, then posts that file with `tracker_review_submit <owner/repo> <pr> comment <body_file>`. The path is `<ops-root>/.claude/session/reviews/bodies/<owner>__<repo>__<pr>-security.md`. `review_body_path <owner/repo> <pr> security <ops-root>` in `_lib-review-markers.sh` prints it. Git ignores the folder. `limit-reviewer-writes.sh` lets a review agent write only in this folder. It blocks a reviewer Write to a repository file, a hook, a settings file or a review marker. Hakim does not write the body with a Bash heredoc, because the Bash gates read quoted command text in the body as commands.
 
 ## Persist the run + render trend
 

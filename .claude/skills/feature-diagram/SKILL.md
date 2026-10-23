@@ -5,9 +5,7 @@ argument-hint: "<feature-slug> [project-name] [--force]"
 allowed-tools: Bash, Read, Grep, Glob, Write, Edit
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /feature-diagram — Per-feature Mermaid Sub-graph
 
@@ -54,7 +52,7 @@ The Path resolution section's example sources the helper *once* for documentatio
 
 ```
 /feature-diagram create-order                       # current project (cwd inside workspace/<name>/ or single-project fork)
-/feature-diagram create-order curios-dog            # registered project
+/feature-diagram create-order sample-app            # registered project
 /feature-diagram reset-password --force             # overwrite existing diagram
 ```
 

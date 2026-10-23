@@ -3,6 +3,11 @@
 # active-reviewer marker is present.
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 HOOK="$SRC_ROOT/.claude/hooks/block-reviewer-repo-mutation.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/apexyard-review-mutation.XXXXXX")
@@ -12,12 +17,13 @@ touch "$TMP/.apexyard-fork"
 git -C "$TMP" init -q
 cp "$HOOK" "$TMP/.claude/hooks/"
 cp "$SRC_ROOT/.claude/hooks/_lib-strip-heredoc.sh" "$TMP/.claude/hooks/"
+cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$TMP/.claude/hooks/"
 printf '%s\n' 'me2resh/apexyard#1233:rex' > "$TMP/.claude/session/active-reviewer"
 
 run_case() {
   local name="$1" command="$2" expected="$3"
   local input output rc
-  input=$(jq -cn --arg command "$command" '{tool_input:{command:$command}}')
+  input=$(jq -cn --arg command "$command" '{agent_type:"code-reviewer",agent_id:"a1",tool_input:{command:$command}}')
   output=$(cd "$TMP" && printf '%s' "$input" | "$TMP/.claude/hooks/block-reviewer-repo-mutation.sh" 2>&1)
   rc=$?
   if [ "$expected" = blocked ] && [ "$rc" -eq 2 ] && printf '%s' "$output" | grep -q 'BLOCKED:'; then
@@ -78,6 +84,19 @@ run_case 'git fast-export remains available' 'git fast-export HEAD' allowed
 run_case 'git rerere status remains available' 'git rerere status' allowed
 run_case 'git maintenance list remains available' 'git maintenance list' allowed
 run_case 'git C config get remains available' 'git -C repo config --get user.name' allowed
+# #1840: a scope or display option before the read action, and the get and
+# list subcommands, are reads. Each config segment is judged alone.
+run_case '#1840 config local get-regexp remains available' "git -C repo config --local --get-regexp '^user\\.'" allowed
+run_case '#1840 config global get remains available' 'git config --global --get user.name' allowed
+run_case '#1840 config local list remains available' 'git config --local --list' allowed
+run_case '#1840 config get subcommand remains available' 'git config get core.worktree' allowed
+run_case '#1840 config list subcommand remains available' 'git config list --local' allowed
+run_case '#1840 config local write is blocked' 'git config --local user.name Reviewer' blocked
+run_case '#1840 config set subcommand is blocked' 'git config set user.name Reviewer' blocked
+run_case '#1840 config unset is blocked' 'git config --unset user.name' blocked
+run_case '#1840 config local unset is blocked' 'git config --local --unset user.name' blocked
+run_case '#1840 config read then write is blocked' 'git config --get user.name && git config user.name Reviewer' blocked
+run_case '#1840 config write then read is blocked' 'git config user.name Reviewer; git config --get user.name' blocked
 run_case 'git format-patch file write is blocked' 'git format-patch HEAD~1..HEAD' blocked
 run_case 'git submodule update remains blocked' 'git submodule update --init' blocked
 run_case 'git fast-export marks write is blocked' 'git fast-export --export-marks=marks.txt HEAD' blocked
@@ -121,7 +140,7 @@ cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$SESS_TMP/.claude/hooks/"
 run_case_sess() {
   local name="$1" sess="$2" command="$3" expected="$4"
   local input output rc
-  input=$(jq -cn --arg command "$command" '{tool_input:{command:$command}}')
+  input=$(jq -cn --arg command "$command" '{agent_type:"code-reviewer",agent_id:"a1",tool_input:{command:$command}}')
   output=$(
     cd "$SESS_TMP" || exit 1
     if [ -n "$sess" ]; then export CLAUDE_CODE_SESSION_ID="$sess"; else unset CLAUDE_CODE_SESSION_ID; fi
@@ -187,7 +206,7 @@ run_case_sess '#1376: legacy shared-path marker does not block a session that ha
 # advisory added for that gap: the command must still succeed (rc=0, the
 # lock is genuinely not armed for sess-C), but stderr must name the legacy
 # marker path so the state is visible instead of silent.
-input=$(jq -cn --arg command 'git commit -m "advisory should not block"' '{tool_input:{command:$command}}')
+input=$(jq -cn --arg command 'git commit -m "advisory should not block"' '{agent_type:"code-reviewer",agent_id:"a1",tool_input:{command:$command}}')
 output=$(
   cd "$SESS_TMP" || exit 1
   export CLAUDE_CODE_SESSION_ID="sess-D"
@@ -198,6 +217,25 @@ if [ "$rc" -eq 0 ] && printf '%s' "$output" | grep -q 'ADVISORY:' && printf '%s'
   echo "PASS: #1400 LOW3: legacy shared-path marker + a session id -> non-blocking stderr advisory, commit still allowed"
 else
   echo "FAIL: #1400 LOW3: legacy shared-path marker + a session id -> non-blocking stderr advisory, commit still allowed (rc=$rc output=$output)" >&2
+  trap - EXIT
+  rm -rf "$TMP" "$SESS_TMP"
+  exit 1
+fi
+
+# (7) me2resh/apexyard#1408 — the #1400 advisory must not print on every Bash
+# call. A read-only command such as `ls` stays silent even when a legacy shared
+# marker file is still on disk.
+input=$(jq -cn --arg command 'ls' '{agent_type:"code-reviewer",agent_id:"a1",tool_input:{command:$command}}')
+output=$(
+  cd "$SESS_TMP" || exit 1
+  export CLAUDE_CODE_SESSION_ID="sess-E"
+  printf '%s' "$input" | "$SESS_TMP/.claude/hooks/block-reviewer-repo-mutation.sh" 2>&1
+)
+rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$output" | grep -q 'ADVISORY:'; then
+  echo "PASS: #1408: legacy shared-path marker + session id + read-only ls -> silent (no advisory spam)"
+else
+  echo "FAIL: #1408: legacy shared-path marker + session id + read-only ls -> silent (rc=$rc output=$output)" >&2
   trap - EXIT
   rm -rf "$TMP" "$SESS_TMP"
   exit 1

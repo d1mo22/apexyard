@@ -5,9 +5,7 @@ disable-model-invocation: false
 argument-hint: "<what you're deciding>"
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /decide — Technical Decision Gate
 
@@ -57,6 +55,8 @@ State the chosen option with justification.
 ### 5. Generate the AgDR
 
 Create file at `{project-root}/docs/agdr/AgDR-{NNNN}-{slug}.md`.
+
+After writing the file, source `.claude/hooks/_lib-review-markers.sh` from the ops fork and run `review_validate_body agdr <path-to-new-AgDR>`. Repair any missing title or required section before reporting the decision. This local check does not approve the decision or write a review marker.
 
 **Important**: AgDRs live in the **current project's repository**, not centralised. Each project has its own `docs/agdr/` folder and its own ID sequence.
 

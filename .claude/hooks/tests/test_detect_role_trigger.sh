@@ -16,6 +16,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # The session-scoped de-dupe (#995) keys on CLAUDE_CODE_SESSION_ID. Unset it
 # for the per-case tests below so each invocation is in the fail-open
 # always-fire mode — deterministic and independent of whatever ambient
@@ -180,6 +185,15 @@ in=$(jq -nc \
   --arg p "bin/run-pre-push-checks.sh" \
   '{hook_event_name:"PreToolUse", tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "trust chain: delegated bin gate fires Security Auditor [#1302]" 0 \
+  "ROLE TRIGGER: Security Auditor" "$in"
+
+# 2e-vi. The second delegated runner added for #1366/AgDR-0173 is the same
+# class of control (it runs a repo's own configured pre-push commands) and
+# must fire the same trigger.
+in=$(jq -nc \
+  --arg p "bin/run-configured-pre-push-checks.sh" \
+  '{hook_event_name:"PreToolUse", tool_name:"Edit", tool_input:{file_path:$p}}')
+run_case "trust chain: second delegated bin gate fires Security Auditor [#1366]" 0 \
   "ROLE TRIGGER: Security Auditor" "$in"
 
 # 2e-v. A .claude path that is NOT trust-chain (a skill doc) stays silent.

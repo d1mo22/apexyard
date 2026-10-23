@@ -96,6 +96,10 @@ tracks closing this gap for those seven keys.
 
   "pr": {
     "title_type_whitelist": ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"]
+  },
+
+  "qa": {
+    "pre_merge_offer": "ask"
   }
 }
 ```
@@ -109,6 +113,109 @@ tracks closing this gap for those seven keys.
 | `branch.type_whitelist` | `validate-branch-name.sh` | Acceptable branch-name prefixes (`feature/`, `fix/`, …). |
 | `commit.type_whitelist` | `validate-commit-format.sh` | Conventional-commit types for commit subjects. |
 | `pr.title_type_whitelist` | `validate-pr-create.sh`, `pr-title-check.yml` (CI) | Conventional-commit types for PR titles. |
+| `external_contributions` | `validate-pr-create.sh` | Repositories you contribute to but do **not** govern. See below. |
+| `build.isolation` | `.claude/rules/isolated-builds.md`, `/fan-out`, build agents | Selects build isolation for the whole ops fork. Default: `worktree`. See [Build isolation](#build-isolation-buildisolation) and [AgDR-0210](agdr/AgDR-0210-build-isolation-setting.md). |
+| `review_identity` | `tracker_review_submit` in `_lib-tracker.sh` | Opt-in GitHub App identity for `gh` reviews. Default `kind` is `operator`. See [Reviewer GitHub App](#reviewer-github-app-review_identity) and [AgDR-0235](agdr/AgDR-0235-reviewer-github-app.md). |
+| `review_markers.extra_review_agents` | `_lib-review-markers.sh` (`review_caller_class`), `block-reviewer-repo-mutation.sh`, `block-reviewer-ci-wait.sh`, `warn-review-marker-write.sh`, `require-active-ticket.sh`, `auto-code-review.sh`, `limit-reviewer-writes.sh` | Adds exact review types. See [Add your own review agent types](hooks-fail-closed.md#add-your-own-review-agent-types). |
+| `qa.pre_merge_offer` | `/code-review` | Controls the advisory pre-merge QA offer after Rex approves. Default: `ask`. |
+| `leak_protection.public_framework_repos` | `check-private-refs-*.sh`, `block-private-refs-in-public-repos.sh` | Known-public `owner/repo` slugs. Origin identity is exempt when origin matches an entry. |
+| `leak_protection.origin_verified_public` | `check-private-refs-staged.sh`, `check-private-refs-runtime.sh` | Exact origin `owner/repo` slug recorded by `/setup` or `/update` after `gh` confirms visibility is PUBLIC. Hooks stay offline and fail closed when this key is missing or does not match origin. See AgDR-0190. |
+
+### `external_contributions` — repos you contribute to but don't govern
+
+An upstream open-source project you send PRs to has its own `CONTRIBUTING.md`
+and its own tracker. Applying this framework's PR-title convention to a PR
+aimed at it refuses a PR that is correct for its destination, and before
+me2resh/apexyard#1448 there was no way to say so.
+
+List those repositories as `owner/name` slugs:
+
+```json
+{
+  "external_contributions": ["openfga/vscode-ext", "openfga/sdk-generator"]
+}
+```
+
+For a listed repository, `validate-pr-create.sh` does not apply the
+`type(TICKET): description` title convention, and prints a one-line note
+saying why.
+It also skips the branch ticket ID, required body sections, and Closes/Refs requirement for external contributions.
+All other checks still apply.
+
+Three properties worth knowing:
+
+- **Empty by default.** The exemption is opt-in. A fork that never sets the key
+  behaves exactly as it did before.
+- **The registry wins.** If a listed repository is also a managed project, the
+  exemption does not apply. Otherwise adding a governed repo to this list would
+  quietly disable title validation for work the framework is meant to govern.
+- **Convention only.** This relaxes a *convention* check. Leak protection,
+  secret scanning, and every security control are unaffected — they arguably
+  matter more here, since these repositories are usually public.
+
+### Pre-merge QA offer
+
+Set `qa.pre_merge_offer` in `.claude/project-config.json` to one of these values:
+
+| Value | After Rex approves |
+| --- | --- |
+| `ask` | Ask whether Salim should verify the PR before merge. This is the default. |
+| `always` | Run Salim on the PR branch before requesting merge approval. |
+| `never` | Skip the offer. Run QA after merge through the existing `qa` label. |
+
+With `ask`, a `no` answer keeps the existing post-merge QA flow. An invalid value falls back to `ask`.
+With `always`, a ticket with no acceptance criteria produces INCOMPLETE and stops before merge approval.
+A Rex re-review after a branch update offers QA again according to this setting.
+
+The offer does not grant merge approval or create a merge gate. Only the human-invoked `/approve-merge` records approval and merges.
+Salim posts a SHA-stamped result on the PR with evidence for every acceptance criterion.
+
+Reuse a complete pre-merge QA PASS only when its stamped SHA matches the merged PR's final head SHA.
+This is the PR head commit when it merged (the MR head SHA on GitLab).
+A PASS stamped with an earlier head does not count.
+Accept reports only from the repository owner, a member or a collaborator, or the account that posted the Rex review.
+On GitHub, verify `author_association` of `OWNER`, `MEMBER` or `COLLABORATOR`, or the Rex account match.
+Otherwise, run post-merge QA as usual.
+
+## Build isolation (`build.isolation`)
+
+The setting applies to the whole ops fork, not per project.
+`worktree` creates `.claude/worktrees/<type>-<ticket>-<short-slug>` or uses the harness worktree.
+`branch` creates a ticket branch in the local copy.
+A managed project's `workspace/<name>` clone counts as the local copy for that project.
+
+Any value other than `branch`, including an empty result, means `worktree`.
+An empty result can occur when the config library cannot load from inside a `workspace/<name>` clone.
+
+`branch` mode applies only to a foreground build spawn when no other writer is active on that checkout.
+A background build spawn always uses a worktree, regardless of `build.isolation`.
+Any build spawn while another writer is active on that checkout uses a worktree, regardless of `build.isolation`.
+Parallel means overlapping writers, including a build agent still working from an earlier spawn.
+The orchestrator decides the mode at spawn time and tells the agent which mode to use.
+Work in another repository and risky destructive git also require a worktree.
+
+In `branch` mode, run `git status --porcelain --untracked-files=no` before switching branches.
+Dirty means tracked files with uncommitted changes or staged changes. Untracked files do not count.
+Refuse to switch branches when dirty and say why.
+Before each commit in `branch` mode, check that HEAD is still your ticket branch with `git branch --show-current`.
+Stop if HEAD is no longer your ticket branch.
+After merge in `branch` mode, return to the base branch and delete the local ticket branch.
+Always tell the user the branch name.
+
+## Reviewer GitHub App (`review_identity`)
+
+`tracker_review_submit` posts GitHub reviews with the operator `gh` login by default.
+Set `review_identity.kind` to `github_app` to post those reviews as a GitHub App.
+The app token is applied to that one `gh pr review` command.
+`tracker_pr_merge` and `/approve-merge` keep the operator login.
+
+The private key path must be outside every git work tree and outside `.claude/`.
+`fallback` value `comment` posts an operator comment when the app path fails.
+Any other value fails closed and posts nothing.
+
+Create the app, store the key, and set the override with the how-to:
+[Use a GitHub App for agent reviews](how-to/reviewer-github-app.md).
+The decision record is [AgDR-0235](agdr/AgDR-0235-reviewer-github-app.md).
 
 ## Extending the defaults
 

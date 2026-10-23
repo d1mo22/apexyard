@@ -29,6 +29,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/validate-pr-create.sh"
 LIB_CFG="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
@@ -73,6 +78,8 @@ make_sandbox() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   [ -f "$LIB_CFG" ]     && cp "$LIB_CFG"     "$sb/.claude/hooks/_lib-read-config.sh"
   [ -f "$LIB_TRACKER" ] && cp "$LIB_TRACKER"  "$sb/.claude/hooks/_lib-tracker.sh"
@@ -122,7 +129,9 @@ Change description.
 ## Glossary
 | Term | Definition |
 |------|------------|
-| #743 | structural parse bug |"
+| #743 | structural parse bug |
+
+Refs #743"
 
 BODY_MISSING_GLOSSARY="## Summary
 Change description.
@@ -215,7 +224,7 @@ rm -f "$BF3"
 BF_REG_PASS=$(mktemp /tmp/test-743-reg-pass.XXXXXX.md)
 BF_REG_FAIL=$(mktemp /tmp/test-743-reg-fail.XXXXXX.md)
 printf '## Summary\nfoo\n\n## Testing\nbar\n' > "$BF_REG_FAIL"
-printf '## Summary\nfoo\n\n## Testing\nbar\n\n## Glossary\n| t | d |\n' > "$BF_REG_PASS"
+printf '## Summary\nfoo\n\n## Testing\nbar\n\n## Glossary\n| t | d |\n\nRefs #743\n' > "$BF_REG_PASS"
 
 run_case "Regression: --body-file missing ## Glossary still BLOCKS" \
   "gh pr create --repo me2resh/apexyard --title 'fix(#743): test' --head fix/#743-test --body-file $BF_REG_FAIL" \
