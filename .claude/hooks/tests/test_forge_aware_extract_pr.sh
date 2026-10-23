@@ -22,6 +22,11 @@
 # Exit 0 = all pass. Exit 1 on first failure.
 
 set -u
+
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 
 HOOK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,6 +52,7 @@ make_sandbox() {
   mkdir -p "$sb/.claude/hooks" "$sb/bin"
   touch "$sb/onboarding.yaml"
   cp "$EXTRACT_LIB"   "$sb/.claude/hooks/_lib-extract-pr.sh"
+  cp "$(dirname "$EXTRACT_LIB")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
   cp "$TRACKER_LIB"   "$sb/.claude/hooks/_lib-tracker.sh"
   cp "$CONFIG_LIB"    "$sb/.claude/hooks/_lib-read-config.sh"
   cp "$PORTFOLIO_LIB" "$sb/.claude/hooks/_lib-portfolio-paths.sh"

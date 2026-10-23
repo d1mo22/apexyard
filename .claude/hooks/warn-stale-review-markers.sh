@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # PostToolUse hook on `git push`: surfaces invalidated review markers at
 # push-time instead of waiting until merge-time.
 #
@@ -41,7 +42,9 @@
 # TODO(apexyard#109): switch to the shared project-config reader once it lands.
 # For now we inline the default and read from config only if the file exists.
 
-INPUT=$(cat)
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
+INPUT="$_GIT_GATE_INPUT"
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
@@ -49,8 +52,15 @@ if [ "$TOOL_NAME" != "Bash" ] || [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Only fire on git push
-if ! echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
+# Only fire on git push. Global options may sit between git and push (#1730).
+HOOK_DIR_STALE="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR_STALE/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR_STALE/_lib-git-global.sh"
+fi
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  command_has_git_subcommand "$COMMAND" push || exit 0
+elif ! echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
   exit 0
 fi
 
@@ -73,14 +83,21 @@ if [ -n "$PUSH_COMBINED" ] && echo "$PUSH_COMBINED" | grep -qEi '\b(rejected|fai
 fi
 
 # Source the marker path helper (#485) so we can construct the right glob.
-HOOK_DIR_STALE="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$HOOK_DIR_STALE/_lib-review-markers.sh" ]; then
   # shellcheck source=/dev/null
   . "$HOOK_DIR_STALE/_lib-review-markers.sh"
 fi
 
 # -------- Resolve repo root + session/reviews dir --------
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+PAYLOAD_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null || true)
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  git_prepare_invocation "$COMMAND" push "$PAYLOAD_CWD"
+fi
+if command -v git_target >/dev/null 2>&1; then
+  REPO_ROOT=$(git_target rev-parse --show-toplevel 2>/dev/null)
+else
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+fi
 if [ -z "$REPO_ROOT" ]; then
   exit 0
 fi
@@ -100,7 +117,7 @@ fi
 # #765/#898. Resolve from the checkout's own `origin` remote FIRST; an
 # unscoped gh call is only the last resort when origin itself can't be
 # determined (e.g. no git remote configured at all).
-_origin_url=$(git remote get-url origin 2>/dev/null)
+_origin_url=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)
 # Strip the `.git` suffix FIRST, then the protocol/host prefix — a single
 # combined regex here is greedy-match-prone (`[^/]+` happily absorbs a
 # literal `.git` as part of the repo-name segment since `.` isn't excluded
@@ -150,7 +167,7 @@ else
 fi
 if [ -z "$PR_HEAD" ]; then
   echo "WARN: warn-stale-review-markers.sh could not resolve PR #${PR_NUMBER} HEAD via gh — falling back to local HEAD." >&2
-  PR_HEAD=$(git rev-parse HEAD 2>/dev/null)
+  PR_HEAD=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)
 fi
 if [ -z "$PR_HEAD" ]; then
   # Neither gh nor git could give us a HEAD — exit silently rather than spam.
@@ -162,9 +179,9 @@ fi
 # per-fork override. Falls back to inline default if the lib is unavailable
 # (bare checkout predating #109).
 ON_STALE="warn"
-if [ -f "$REPO_ROOT/.claude/hooks/_lib-read-config.sh" ]; then
+if [ -f "$HOOK_DIR_STALE/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
-  . "$REPO_ROOT/.claude/hooks/_lib-read-config.sh"
+  . "$HOOK_DIR_STALE/_lib-read-config.sh"
   CFG=$(config_get_or '.review_markers.on_stale' 'warn' 2>/dev/null)
   if [ "$CFG" = "delete" ] || [ "$CFG" = "warn" ]; then
     ON_STALE="$CFG"
@@ -221,3 +238,17 @@ for MARKER in "$REVIEWS_DIR"/$MARKER_GLOB; do
 done
 
 exit 0
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body advisory "$_GIT_GATE_INPUT" push
+  exit $?
+fi
+_git_gate_body

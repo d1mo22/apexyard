@@ -1,12 +1,10 @@
 name: tests
 
-# Runs the framework's mechanical-enforcement test suites (the ~60 test_*.sh
-# under .claude/**/tests/) on every PR and on push to dev/main. Until now these
-# tests were advisory — only 2 ran in CI — so a hook regression could ship
-# green. This job makes the whole suite a gate. See me2resh/apexyard#526.
-
 on:
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
   push:
     branches: [dev, main]
 
@@ -14,21 +12,86 @@ permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.ref }}
+  # The nightly run gets its own group, so a push cannot cancel it and open
+  # a false "Nightly CI failed" issue.
+  group: tests-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  hook-tests:
-    name: hook test suite
+  tier:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tier: ${{ steps.select.outputs.tier }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'schedule' && 'dev' || github.sha }}
+      - id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tier=heavy
+          if [ "$EVENT" = pull_request ]; then
+            tier=light
+            if [[ "$HEAD_BRANCH" == release/v* || "$PR_TITLE" == release\(* ]]; then
+              tier=release
+            else
+              git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed"
+              if bash bin/select-affected-tests.sh --docs-only "$RUNNER_TEMP/changed"; then tier=docs; fi
+            fi
+          fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          if [ "$tier" = heavy ] || [ "$tier" = release ]; then
+            matrix='{"include":[{"os":"ubuntu-latest","label":"linux jq-1.7"},{"os":"ubuntu-latest","label":"linux jq-1.8"}]}'
+          else
+            matrix='{"include":[{"os":"ubuntu-latest","label":"linux jq-1.7"}]}'
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  hook-tests:
+    needs: tier
+    if: needs.tier.outputs.tier != 'docs'
+    name: hook tests (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.tier.outputs.matrix) }}
     steps:
       - name: Checkout
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'schedule' && 'dev' || github.sha }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install jq (used by the hooks + their tests)
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+
+      - name: Install strace (the hook-level process count test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -qq strace
+
+      - name: Install jq 1.8.2
+        if: matrix.label == 'linux jq-1.8'
+        run: |
+          jq_bin="$RUNNER_TEMP/jq-1.8-bin"
+          mkdir -p "$jq_bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64 \
+            --output "$jq_bin/jq"
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  $jq_bin/jq" | sha256sum -c -
+          chmod +x "$jq_bin/jq"
+          echo "$jq_bin" >> "$GITHUB_PATH"
+          export PATH="$jq_bin:$PATH"
+          test "$(jq --version)" = jq-1.8.2
 
       - name: Configure git identity (test sandboxes run git init/commit)
         run: |
@@ -37,4 +100,87 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Run the hook test suite
-        run: bash bin/run-hook-tests.sh
+        run: |
+          jq --version
+          command -v jq
+          bash --version | head -1
+          /bin/bash --version | head -1
+          python3 --version
+          # The reviewed snapshot ref exists only in upstream, not in forks.
+          snapshot_upstream=me2resh/apexyard
+          snapshot_repo=$(mktemp -d)
+          trap 'rm -rf "$snapshot_repo"' EXIT
+          git -C "$snapshot_repo" init -q --bare
+          git -C "$snapshot_repo" fetch -q --no-tags \
+            "$GITHUB_SERVER_URL/$snapshot_upstream.git" \
+            refs/pull/1466/head:refs/heads/reviewed-snapshots
+          # Pin full 40-character SHAs for the reviewed command-scrub snapshots
+          # (PR #1466). Short SHAs can become ambiguous as history grows.
+          # Verify each commit after the fetch so a missing object fails clearly.
+          for sha in \
+            39c5b959f0544785c643c6945b487ec579b4a035 \
+            d5e7ce4d50e07bd0bd026230e1fb78714e809a27 \
+            1fea7308d0a6de4412198b1bc645ada8a47a8f05
+          do
+            if ! git -C "$snapshot_repo" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              echo "CI snapshot proof failed: commit ${sha}" \
+                "is not present after fetching refs/pull/1466/head" \
+                "from ${snapshot_upstream}" >&2
+              exit 1
+            fi
+          done
+          APEXYARD_SNAPSHOT_REPO="$snapshot_repo" REQUIRE_SNAPSHOTS=1 \
+            /bin/bash bin/run-hook-tests.sh
+
+  conformance:
+    needs: tier
+    # Conformance needs the CONFORMANCE_* secrets. Set the repo variable
+    # CONFORMANCE_ON_RELEASE=true once they exist; until then it is skipped.
+    if: needs.tier.outputs.tier == 'release' && vars.CONFORMANCE_ON_RELEASE == 'true'
+    # GitHub checks nested job permissions at startup, even for jobs that
+    # skip. The badge job in conformance.yml asks for these two.
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/conformance.yml
+    secrets: inherit
+
+  # The dev ruleset requires "hook test suite". Matrix jobs have distinct names.
+  # This final job fails unless every leg passes, preserving the required check.
+  hook-test-suite:
+    name: hook test suite
+    needs: [tier, hook-tests, conformance]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every matrix leg to pass
+        env:
+          MATRIX_RESULT: ${{ needs.hook-tests.result }}
+          TIER_RESULT: ${{ needs.tier.result }}
+          TIER: ${{ needs.tier.outputs.tier }}
+          CONFORMANCE_RESULT: ${{ needs.conformance.result }}
+          CONFORMANCE_ON_RELEASE: ${{ vars.CONFORMANCE_ON_RELEASE }}
+        run: |
+          test "$TIER_RESULT" = success
+          if [ "$TIER" = docs ]; then test "$MATRIX_RESULT" = skipped; else test "$MATRIX_RESULT" = success; fi
+          if [ "$TIER" = release ] && [ "$CONFORMANCE_ON_RELEASE" = true ]; then test "$CONFORMANCE_RESULT" = success; fi
+
+  nightly-failure:
+    needs: hook-test-suite
+    if: always() && github.event_name == 'schedule' && needs.hook-test-suite.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const title = 'Nightly CI failed';
+            const body = `Nightly CI on dev failed: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100 });
+            const issue = issues.find(i => !i.pull_request && i.title === title);
+            if (issue) await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+            else await github.rest.issues.create({ owner, repo, title, body });

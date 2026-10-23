@@ -12,6 +12,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 LIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/_lib-detect-bash-write.sh"
 if [ ! -f "$LIB_SRC" ]; then
   echo "FAIL: lib not found at $LIB_SRC" >&2
@@ -92,6 +97,9 @@ assert_write "tar xzf"              "tar xzf archive.tar.gz"
 assert_write "tar --extract"        "tar --extract --file=archive.tar"
 assert_write "curl -o"              "curl -o /tmp/x https://example.com/f"
 assert_write "curl --output"        "curl --output /tmp/x https://example.com/f"
+assert_write "curl -sSo"            "curl -sSo out.txt https://x"
+assert_write "curl -fsSLo"          "curl -fsSLo out.txt https://x"
+assert_write "curl output-dir -sSo" "curl --output-dir /tmp -sSo out.txt https://x"
 assert_write "wget -O"              "wget -O /tmp/x https://example.com/f"
 assert_write "wget --output-doc"    "wget --output-document=/tmp/x https://example.com/f"
 
@@ -132,6 +140,118 @@ assert_read  "stderr merge"   "make build 2>&1"
 assert_read  "python read"    'python3 -c "print(open(\"/tmp/x\").read())"'
 assert_read  "node read"      'node -e "console.log(require(\"fs\").readFileSync(\"/tmp/x\", \"utf8\"))"'
 
+# #1372 — the mode must be read from the SECOND argument, not from anywhere
+# inside the parentheses. The "python read" case above passes on `dev` only
+# because `/tmp/x` happens to contain no w, a or +; a realistic path does. A
+# single-argument open() is always mode 'r' in Python.
+assert_read  "python read, path contains 'a'" 'python3 -c "print(open(\"data.txt\").read())"'
+assert_read  "python read, dotted path"       'python3 -c "print(open(\".claude/x.json\").read())"'
+assert_read  "python read, explicit r mode"   'python3 -c "print(open(\"data.txt\", \"r\").read())"'
+assert_read  "python read, binary mode"       'python3 -c "print(open(\"data.txt\", \"rb\").read())"'
+
+# Write modes. None of these call .write(), so the open() mode alone decides —
+# otherwise the neighbouring `\.write\b` clause carries the verdict and the mode
+# is never actually tested. The path contains no w, a or + for the same reason:
+# with a path like "data.txt" the old form matched the filename instead.
+#
+# Only the 'x' case discriminates old from new — 'x' was absent from the old
+# mode class entirely. The 'r+' and keyword-mode cases pass either way (via the
+# literal '+' and 'w'); they are regression guards, not bug pins.
+assert_write "python open x mode"             'python3 -c "open(\"file.txt\", \"x\")"'
+assert_write "python open r+ mode"            'python3 -c "open(\"file.txt\", \"r+\")"'
+assert_write "python open keyword mode"       'python3 -c "open(\"file.txt\", mode=\"w\")"'
+
+# Nested parentheses in the path argument — the most common real write idiom.
+# A `[^)]*` form cannot cross the inner `)`, so it would miss all three. `dev`
+# catches the Path() and os.path.join() forms only by accident, via the `a` in
+# "Path" and "path"; it misses str(p) outright.
+assert_write "python open, nested Path()"     'python3 -c "open(pathlib.Path(d) / \"f\", \"w\")"'
+assert_write "python open, nested str()"      'python3 -c "open(str(p), \"w\")"'
+assert_write "python open, os.path.join"      'python3 -c "open(os.path.join(d, \"f\"), \"w\")"'
+
+# pathlib.Path.open() takes the MODE as its FIRST positional argument, unlike
+# the builtin open(file, mode). So there is no comma, and a clause written for
+# the builtin misses it — while `Path("f").open("w")` truncates a real file on
+# open, before any .write() call. Needs its own clause.
+assert_write "pathlib Path.open w"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"w\").close()"'
+assert_write "pathlib Path.open a"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"a\")"'
+assert_write "pathlib Path.open x"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"x\")"'
+assert_read  "pathlib Path.open r"            'python3 -c "import pathlib; print(pathlib.Path(\"f.txt\").open(\"r\").read())"'
+assert_read  "pathlib Path.open default"      'python3 -c "import pathlib; print(pathlib.Path(\"f.txt\").open().read())"'
+
+# Keyword-argument mode on Path.open(). There is no comma before the mode
+# token, so a clause anchoring the mode immediately after `.open(` misses it —
+# and `Path(p).open(mode="w", encoding=...)` is the more idiomatic form once
+# an encoding is also passed.
+assert_write "pathlib Path.open mode kwarg"   'python3 -c "from pathlib import Path; Path(\"f\").open(mode=\"w\")"'
+assert_write "pathlib Path.open kwarg+enc"    'python3 -c "from pathlib import Path; Path(\"f\").open(mode=\"w\", encoding=\"utf-8\")"'
+assert_read  "pathlib Path.open r kwarg"      'python3 -c "from pathlib import Path; print(Path(\"f\").open(mode=\"r\").read())"'
+
+# The mode is unknowable at the call site, so this is treated as a write.
+assert_write "python open star-args"          'python3 -c "open(*args)"'
+
+# Archive extraction writes files. `dev` caught the tarfile form only because
+# every ".tar" path contains an `a`, and never caught the zipfile form at all.
+# A mode that is not a quoted literal cannot be read, so the call counts as a
+# write. These shapes were all caught on `dev` only by the letter `a` in an
+# identifier like `path` or `args` — rename the variable and that accident
+# disappears, which is why each is pinned here rather than left to the earlier
+# plain-identifier form.
+assert_write "python open, kwarg variable mode"  'python3 -c "open(path, mode=mode)"'
+assert_write "python open, attribute mode"       'python3 -c "open(path, self.mode)"'
+assert_write "python open, argparse attr mode"   'python3 -c "open(path, args.mode)"'
+assert_write "python open, method-call mode"     'python3 -c "open(p, mode.lower())"'
+assert_write "python open, nested arg + var"     'python3 -c "open(str(path), mode)"'
+assert_write "python open, join + var mode"      'python3 -c "open(os.path.join(d, \"f\"), m)"'
+assert_write "python tarfile, kwarg var mode"    'python3 -c "import tarfile; tarfile.open(path, mode=m)"'
+assert_write "python os.open, nested arg"        'python3 -c "import os; os.open(str(path), os.O_WRONLY)"'
+assert_write "python os.open, join + O_CREAT"    'python3 -c "import os; os.open(os.path.join(d, \"f\"), os.O_CREAT)"'
+
+# A quoted argument beside a variable mode. The "no quote after the first
+# comma" form above cannot see these: the `encoding=` or the positional
+# `"utf-8"` supplies the quote, and `"utf-8"` is not a mode token either, so
+# both earlier clauses pass the call through. All four are writes on `dev`.
+assert_write "python open, var mode + encoding"  'python3 -c "open(path, mode, encoding=\"utf-8\")"'
+assert_write "python gzip, var mode + encoding"  'python3 -c "import gzip; gzip.open(path, mode, encoding=\"utf-8\")"'
+assert_write "python open, kwarg mode + newline" 'python3 -c "open(path, mode=mode, newline=\"\")"'
+assert_write "python codecs, var mode + charset" 'python3 -c "import codecs; codecs.open(path, mode, \"utf-8\")"'
+assert_write "python with-open var mode + enc"   'python3 -c "
+with open(path, mode, encoding=\"utf-8\") as f:
+    json.dump(d, f)
+"'
+
+# The read side of the same shape: a quoted `encoding=` with no mode argument
+# at all stays a read, which is the #1372 symptom this PR exists to remove.
+assert_read  "python open, encoding only"        'python3 -c "open(p, encoding=\"utf-8\").read()"'
+
+# shelve has its own mode alphabet: c creates, n creates new, w writes. Only r
+# is read-only, and none of the write letters is in the file-mode class.
+assert_write "python shelve.open c mode"         'python3 -c "import shelve; shelve.open(path, \"c\")"'
+assert_write "python shelve.open n mode"         'python3 -c "import shelve; shelve.open(path, \"n\")"'
+assert_read  "python shelve.open r mode"         'python3 -c "import shelve; shelve.open(path, \"r\")"'
+
+assert_write "python tarfile extractall"      'python3 -c "import tarfile; tarfile.open(\"b.tar\").extractall(\".\")"'
+assert_write "python zipfile extractall"      'python3 -c "import zipfile; zipfile.ZipFile(\"b.zip\").extractall(\".\")"'
+
+# tarfile write modes carry a compression suffix after ":" or "|". Those
+# characters would otherwise end the mode token early and read as a read.
+assert_write "python tarfile w:gz"            'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w:gz\")"'
+assert_write "python tarfile w|gz stream"     'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w|gz\")"'
+assert_write "python tarfile x:bz2"           'python3 -c "import tarfile; tarfile.open(\"out.tbz\", \"x:bz2\")"'
+assert_read  "python tarfile r:gz"            'python3 -c "import tarfile; tarfile.open(\"in.tgz\", \"r:gz\")"'
+
+# A mode held in a variable could be any mode. dev caught these only because a
+# realistic identifier like "path" contains an "a" — rename it and the accident
+# disappears, so match the shape instead.
+assert_write "python open, variable mode"     'python3 -c "open(path, mode)"'
+assert_write "python open, other var names"   'python3 -c "open(filename, filemode)"'
+assert_read  "python open, kwarg not a mode"  'python3 -c "print(open(p, encoding=\"utf-8\").read())"'
+
+# os.open takes integer flags rather than a mode string.
+assert_write "python os.open O_WRONLY"        'python3 -c "import os; os.open(path, os.O_WRONLY|os.O_CREAT)"'
+assert_write "python os.open O_APPEND"        'python3 -c "import os; os.open(path, os.O_APPEND)"'
+assert_read  "python os.open O_RDONLY"        'python3 -c "import os; os.open(path, os.O_RDONLY)"'
+
 # #153 — counterexamples for the new matcher families.
 assert_read  "cp --help"      "cp --help"
 assert_read  "cp --version"   "cp --version"
@@ -144,6 +264,10 @@ assert_read  "tar --list"     "tar --list -f archive.tar"
 assert_read  "tar -tzf"       "tar -tzf archive.tar.gz"
 assert_read  "curl -s url"    "curl -s https://example.com/f"
 assert_read  "curl bare"      "curl https://example.com/f"
+assert_read  "curl -sSL"      "curl -sSL https://x"
+assert_read  "curl -fsS"      "curl -fsS https://x"
+assert_read  "curl header"    "curl -sS -H 'X: y' https://x"
+assert_read  "curl output-dir" "curl --output-dir /tmp https://x"
 assert_read  "wget --help"    "wget --help"
 assert_read  "wget bare"      "wget https://example.com/f"
 assert_read  "deno fmt"       "deno fmt"
@@ -166,6 +290,11 @@ assert_target "cp last arg"        "cp src.txt /tmp/dst.txt"    "/tmp/dst.txt"
 assert_target "mv last arg"        "mv a.txt /tmp/b.txt"        "/tmp/b.txt"
 assert_target "curl -o path"       "curl -o /tmp/f https://example.com/f"        "/tmp/f"
 assert_target "curl --output"      "curl --output /tmp/f https://example.com/f"  "/tmp/f"
+assert_target "curl -sSo path"      "curl -sSo out.txt https://x" "out.txt"
+assert_target "curl -fsSLo path"    "curl -fsSLo out.txt https://x" "out.txt"
+assert_target "curl -sSo quotes"    "curl -sSo 'out.txt' https://x" "out.txt"
+assert_target "curl -fsSLo quotes"  'curl -fsSLo "out.txt" https://x' "out.txt"
+assert_target "curl output-dir -sSo" "curl --output-dir /tmp -sSo out.txt https://x" "out.txt"
 assert_target "wget -O path"       "wget -O /tmp/f https://example.com/f"        "/tmp/f"
 
 # --- target extraction (documented misses — empty result) --------------
@@ -422,6 +551,200 @@ fi
 assert_targets "python -c (miss) contributes nothing" \
   'python3 -c "open(\"/tmp/x\",\"w\").write(\"hi\")"'                                 ""
 
+# --- #1414: `>&word`, grouped/long sed -i, and sed `w` -----------------
+#
+# Each write below changed a file and passed the gate on dev at 5be9ecb
+# (bash 5.3.9, GNU sed 4.9). The read cases pin the exclusions that keep
+# the fix from blocking common read-only commands.
+
+# `>&word` is the second spelling of "send stdout and stderr to a file".
+assert_write "#1414 '>&word'"              "echo x >&src/app.ts"
+assert_write "#1414 '>& word'"             "echo x >& src/app.ts"
+assert_write "#1414 '1>&word'"             "echo x 1>&src/app.ts"
+assert_write "#1414 word ending in a digit" "echo x2>&out.txt"
+assert_write "#1414 '>&' word not all digits" "echo x >&9f1"
+assert_write "#1414 '>&' quoted word"      'echo x >&"out.txt"'
+assert_read  "#1414 '>&2' descriptor copy" "echo x >&2"
+assert_read  "#1414 '1>&2' descriptor copy" "echo x 1>&2"
+assert_read  "#1414 '>&12' descriptor copy" "echo x >&12"
+assert_read  "#1414 '>&-' closes stdout"   "echo x >&-"
+assert_read  "#1414 '3>&-' closes fd 3"    "exec 3>&-"
+assert_read  "#1414 '>&3-' moves fd 3"     "echo x >&3-"
+assert_read  "#1414 '3>&1' descriptor copy" "exec 3>&1"
+assert_targets "#1414 '>&word' target"     "echo x >&src/app.ts"                "src/app.ts"
+assert_targets "#1414 '>& word' target"    "echo x >& src/app.ts"               "src/app.ts"
+assert_targets "#1414 fd copy then '>&word'" "echo a >&2; echo b >&out.txt"     "out.txt"
+assert_target  "#1414 '>&word' single target" "echo x >&src/app.ts"             "src/app.ts"
+assert_not_deletion_only "#1414 rm + '>&word' hides a real write" \
+  "rm old.ts; echo x >&src/app.ts"
+
+# sed -i inside a group of short flags, with a suffix, or as --in-place.
+assert_write "#1414 sed -Ei"               "sed -Ei 's/a/b/' src/app.ts"
+assert_write "#1414 sed -ni"               "sed -ni 's/a/b/p' src/app.ts"
+assert_write "#1414 sed -si"               "sed -si 's/a/b/' src/app.ts"
+assert_write "#1414 sed -ie (suffix e)"    "sed -ie 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-place"        "sed --in-place 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-place=.bak"   "sed --in-place=.bak 's/a/b/' src/app.ts"
+assert_read  "#1414 sed -ei runs script i" "sed -ei src/app.ts"
+assert_read  "#1414 sed -f script file"    "sed -f script.sed src/app.ts"
+assert_read  "#1414 sed --posix"           "sed --posix 's/a/b/' src/app.ts"
+assert_targets "#1414 sed -Ei target"      "sed -Ei 's/a/b/' src/app.ts"        "src/app.ts"
+assert_targets "#1414 sed --in-place target" "sed --in-place 's/a/b/' src/app.ts" "src/app.ts"
+
+# sed `w` / `W` command and the `s///w` flag.
+assert_write "#1414 sed w command"         "sed -n 'w out.txt' in.txt"
+assert_write "#1414 sed /re/w"             "sed -n '/re/w out.txt' in.txt"
+assert_write "#1414 sed s///w flag"        "sed 's/a/b/w out.txt' in.txt"
+assert_write "#1414 sed s///gw flags"      "sed 's/a/b/gw out.txt' in.txt"
+assert_write "#1414 sed 1w"                "sed -n '1w out.txt' in.txt"
+assert_write "#1414 sed \$w"               "sed -n '\$w out.txt' in.txt"
+assert_write "#1414 sed 1,3w"              "sed -n '1,3w out.txt' in.txt"
+assert_write "#1414 sed 1!w"               "sed -n '1!w out.txt' in.txt"
+assert_write "#1414 sed p;w"               "sed -n 'p;w out.txt' in.txt"
+assert_write "#1414 sed p; w"              "sed -n 'p; w out.txt' in.txt"
+assert_write "#1414 sed s|a|b|w"           "sed 's|a|b|w out.txt' in.txt"
+assert_write "#1414 sed W command"         "sed -n 'W out.txt' in.txt"
+assert_write "#1414 sed -e 'w file'"       "sed -n -e 'w out.txt' in.txt"
+assert_read  "#1414 sed s/w/x/ is a read"  "sed 's/w/x/' in.txt"
+assert_read  "#1414 sed /warning/p is a read" "sed -n '/warning/p' in.txt"
+assert_read  "#1414 sed /^w/p is a read"   "sed -n '/^w/p' in.txt"
+assert_read  "#1414 sed s/www/x/g is a read" "sed 's/www/x/g' in.txt"
+assert_read  "#1414 sed y/w/x/ is a read"  "sed 'y/w/x/' in.txt"
+assert_read  "#1414 sed s#w#x# is a read"  "sed 's#w#x#' in.txt"
+assert_read  "#1414 sed s/a w b/c/ is a read" "sed 's/a w b/c/' in.txt"
+assert_read  "#1414 quoted operand starting with w" "sed -n p 'words.txt'"
+assert_read  "#1414 'w x' with no sed"     "echo 'w x'"
+assert_targets "#1414 sed w target"        "sed -n 'w out.txt' in.txt"          "out.txt"
+assert_targets "#1414 sed s///w target"    "sed 's/a/b/w out.txt' in.txt"       "out.txt"
+assert_targets "#1414 sed w after ; in the script" \
+  "sed -n 'p;w out.txt' in.txt"                                                  "out.txt"
+assert_target  "#1414 sed w: single-target extractor returns empty (plural only)" \
+  "sed -n '/re/w out.txt' in.txt"                                                ""
+assert_not_deletion_only "#1414 rm + sed w hides a real write" \
+  "rm old.ts; sed -n 'w src/app.ts' in.txt"
+
+# fd copies that end at `)`, a backtick, or a quote stay reads. Each of
+# these reported a write to `1)`, `` 1` ``, or `2` before the fix.
+assert_read  "#1414 \$(cmd 2>&1) is a read"       'out=$(npm test 2>&1)'
+assert_read  "#1414 backtick cmd 2>&1 is a read"  'result=`ls 2>&1`'
+assert_read  "#1414 (cmd 2>&1) subshell is a read" '(cd sub && make 2>&1)'
+assert_read  "#1414 bash -c \"cmd 2>&1\" is a read" 'bash -c "npm test 2>&1"'
+assert_read  "#1414 bash -c 'cmd >&2' is a read"  "bash -c 'echo hi >&2'"
+assert_read  "#1414 grep '>&2' is a read"         "grep -rn '>&2' .claude/hooks/"
+assert_read  "#1414 >&\"2\" quoted fd copy"        'echo x >&"2"'
+assert_read  "#1414 \$(cmd 2>&1) || echo"          'r=$(npm test 2>&1) || echo "$r"'
+assert_write "#1414 >&2} writes a file named 2}"  "echo x >&2}"
+
+# More sed -i spellings, and dash-words that are not sed flags.
+assert_write "#1414 sed --i (prefix)"             "sed --i 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in (prefix)"            "sed --in 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-pl=.bak (prefix)"    "sed --in-pl=.bak 's/a/b/' src/app.ts"
+assert_read  "#1414 find ... -exec sed ... -print" "find . -name '*.md' -exec sed -n 1p {} + -print"
+assert_read  "#1414 sed s/ -api/x/ is a read"     "sed 's/ -api/x/' in.txt"
+assert_read  "#1414 commit message mentioning sed -pi" 'git commit -m "fix sed -pi flag doc"'
+
+# More sed w positions.
+assert_write "#1414 sed s#a#b#w"                  "sed 's#a#b#w out.txt' in.txt"
+assert_write "#1414 sed s/a/b/pw"                 "sed 's/a/b/pw out.txt' in.txt"
+assert_write "#1414 sed /re/Iw"                   "sed -n '/re/Iw out.txt' in.txt"
+assert_write "#1414 sed s,a,b,w"                  "sed 's,a,b,w out.txt' in.txt"
+assert_write "#1414 sed s:a:b:w"                  "sed 's:a:b:w out.txt' in.txt"
+assert_write "#1414 sed s@a@b@w"                  "sed 's@a@b@w out.txt' in.txt"
+assert_write "#1414 sed s%a%b%w"                  "sed 's%a%b%w out.txt' in.txt"
+assert_write "#1414 sed \\,re,w"                  "sed -n '\\,re,w out.txt' in.txt"
+assert_write "#1414 sed ' w file' (space after quote)" "sed -n ' w out.txt' in.txt"
+assert_read  "#1414 sed then | grep 'w x' is a read" "sed -n 1p in.txt | grep 'w x'"
+
+# A sed -i edit whose file the extractor misses must not be hidden by an
+# exempt `w` target. Before the fix these extracted only the `w` target,
+# and the gate passed them. Now they extract nothing, and the gate fails
+# closed, as it did before #1414.
+assert_write   "#1414 sed -i with s///w /dev/stdout" 'sed -i "s/foo/bar/w /dev/stdout" src/app.ts'
+assert_targets "#1414 sed -i + exempt w target yields no target" \
+  'sed -i "s/foo/bar/w /dev/stdout" src/app.ts'                                  ""
+# sed is outside the data-only allowlist, so the scrubber returns raw. A
+# top-level ";" inside the quoted script still splits segments, so neither
+# target is extracted reliably. Empty targets match upstream/dev / bb447a9.
+# The ticket gate still blocks via appears_to_write + unextractable write.
+assert_targets "#1414 sed -i with ;w yields no target" \
+  "sed -i 's/a/b/;w /tmp/x' src/app.ts"                                          ""
+assert_targets "#1414 sed w then sed -i yields no target" \
+  'sed -n "w /tmp/x" in.txt && sed -i "s/a/b/" src/app.ts'                       ""
+assert_targets "#1414 sed -i file and its w file both extracted" \
+  "sed -i 's/a/b/w /tmp/log' src/app.ts"                                         "src/app.ts,/tmp/log"
+assert_targets "#1414 in-repo w file beside an exempt sed -i file" \
+  "sed -i 's/a/b/w src/b.ts' /tmp/x.txt"                                         "/tmp/x.txt,src/b.ts"
+
+# A sed `w` decoy must not hide another family's write that has no
+# extractable target. The segment pass finds nothing, so the `w` target
+# is held back, and the gate fails closed as it did before #1414.
+assert_targets "#1414 awk -i inplace + w decoy yields no target" \
+  "awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt"                        ""
+assert_targets "#1414 python -c + w decoy yields no target" \
+  "python3 -c \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt"   ""
+assert_targets "#1414 tar -x + w decoy yields no target" \
+  "tar -xf a.tar; sed -n 'w /tmp/x' in.txt"                                      ""
+assert_targets "#1414 go run + w decoy yields no target" \
+  "go run ./gen && sed -n 's/x/y/w /dev/stdout' out.txt"                         ""
+assert_targets "#1414 rm is not a decoy victim: w target kept" \
+  "rm -f old.ts; sed -n 'w /tmp/x' in.txt"                                       "/tmp/x"
+
+# One case for each family in _bdw_detects_other_write whose write has no
+# extractable target. Each pins that family's entry. Dropping one from the
+# helper would let the exempt `w` decoy unlock that family's write.
+while IFS= read -r fam_cmd; do
+  [ -z "$fam_cmd" ] && continue
+  assert_targets "#1414 w decoy beside: ${fam_cmd:0:44}" \
+    "$fam_cmd; sed -n 'w /tmp/x' in.txt"                                         ""
+done <<'FAMILIES'
+node -e "require('fs').writeFileSync('src/app.ts','x')"
+ruby -e "File.write('src/app.ts','x')"
+perl -e "unlink 'src/app.ts'"
+php -r "file_put_contents('src/app.ts','x');"
+deno run --allow-write gen.ts
+bun run gen.ts
+go run ./gen
+python3 -c "open('src/app.ts','w').write('x')"
+dd if=/dev/zero of=src/app.ts count=1
+install -m 644 a.ts src/app.ts
+curl --output=src/app.ts https://example.com/f
+wget --output-document=src/app.ts https://example.com/f
+tar -xf a.tar
+awk -i inplace 1 src/app.ts
+sed -i "s/a/b/" src/app.ts
+FAMILIES
+
+# Redirects and tee normally yield a target. Their entries matter only
+# when the target strips to nothing, as with an empty quoted word. These
+# two cases pin those entries, so the helper keeps parity with
+# bash_command_appears_to_write.
+assert_targets "#1414 w decoy beside a redirect to an empty word" \
+  "echo x > \"\"; sed -n 'w /tmp/x' in.txt"                                      ""
+assert_targets "#1414 w decoy beside tee with an empty word" \
+  "echo x | tee \"\"; sed -n 'w /tmp/x' in.txt"                                  ""
+
+# The heredoc families need the decoy first, because a heredoc ends on a
+# line that holds only its terminator.
+#
+# Expect empty targets — same as upstream/dev. python3/node/ruby sit outside
+# the data-only allowlist (AgDR-0181), so the write detector sees the heredoc
+# body. That fires _bdw_detects_other_write and holds the sed `w` decoy back.
+# Scrubbing at 39c5b95 blanked the body and yielded /tmp/x. Returning raw for
+# non-allowlisted tools restores the pre-scrub hold-back, not that scrub-era
+# result.
+assert_targets "#1414 w decoy before a python heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; python3 - <<'PY'\nopen('src/app.ts','w').write('x')\nPY")" ""
+assert_targets "#1414 w decoy before a node heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; node <<'JS'\nrequire('fs').writeFileSync('src/app.ts','x')\nJS")" ""
+assert_targets "#1414 w decoy before a ruby heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; ruby <<'RB'\nFile.write('src/app.ts','x')\nRB")" ""
+
+# An escaped quote after an fd copy stays a read.
+assert_read  "#1414 escaped quote after 2>&1 is a read" 'bash -c "sh -c \"make 2>&1\""'
+
+# BSD sed documents -I as in-place. GNU rejects it.
+assert_write "#1414 sed -I (BSD in-place)"        "sed -I '' 's/a/b/' src/app.ts"
+
 # --- #931 residual 1: `<>` read-write open is now DETECTED as a write ---
 #
 # `[n]<>word` opens `word` for both reading AND writing — a real,
@@ -517,6 +840,104 @@ chore: subject
 
 Body prose ending in portfolio.
 MSG" ""
+
+# --- #1480: git log/diff --output, sort -o, yq -i, python3 -Bc -------------
+#
+# Each form wrote a tracked file on dev without the ticket gate seeing it.
+# Detect the write. Extract the path when the flag names it. python3 -Bc
+# stays unextractable and still blocks under the #1416 rule.
+# python3 -cB is gated conservatively even though Python reads it as -c with
+# program text B (not a bundled B flag).
+
+assert_write  "#1480 git log --output=file" \
+  "git log --output=src/app.ts"
+assert_write  "#1480 git log --output file" \
+  "git log --output src/app.ts"
+assert_write  "#1480 git diff --output=file" \
+  "git diff --output=src/app.ts"
+assert_write  "#1480 git diff --output file" \
+  "git diff --output src/app.ts"
+assert_write  "#1480 sort -o file" \
+  "sort -o src/app.ts input.txt"
+assert_write  "#1480 sort --output=file" \
+  "sort --output=src/app.ts input.txt"
+assert_write  "#1480 sort -uo file" \
+  "sort -uo src/app.ts input.txt"
+assert_write  "#1480 sort -oFILE attached" \
+  "sort -osrc/app.ts input.txt"
+assert_write  "#1480 /usr/bin/sort -o file" \
+  "/usr/bin/sort -o src/app.ts input.txt"
+assert_read   "#1480 ps --sort is not the sort command" \
+  "ps --sort -rss -o pid"
+assert_write  "#1480 yq -i file" \
+  'yq -i ".a=1" src/app.ts'
+assert_write  "#1480 yq --inplace file" \
+  'yq --inplace ".a=1" src/app.ts'
+assert_write  "#1480 yq -Pi bundled" \
+  'yq -Pi ".a=1" src/app.ts'
+assert_write  "#1480 python3 -Bc open w" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\""
+# Conservatively gated: Python treats -cB as -c with program text B.
+assert_write  "#1480 python3 -cB open w (conservative)" \
+  "python3 -cB \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -W ignore -c open w" \
+  "python3 -W ignore -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -X utf8 -c open w" \
+  "python3 -X utf8 -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python -W error -c open w" \
+  "python -W error -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -B -W ignore -c open w" \
+  "python3 -B -W ignore -c \"open('src/app.ts','w').write('x')\""
+
+assert_target  "#1480 git log --output= extracts" \
+  "git log --output=src/app.ts" "src/app.ts"
+assert_target  "#1480 git log --output space extracts" \
+  "git log --output src/app.ts" "src/app.ts"
+assert_target  "#1480 git diff --output= extracts" \
+  "git diff --output=src/app.ts" "src/app.ts"
+assert_target  "#1480 sort -o extracts" \
+  "sort -o src/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 sort -uo extracts" \
+  "sort -uo src/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 sort -oFILE extracts" \
+  "sort -osrc/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 yq -i extracts last path" \
+  'yq -i ".a=1" src/app.ts' "src/app.ts"
+assert_target  "#1480 python3 -Bc target stays empty" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"" ""
+
+assert_targets "#1480 git log --output= plural" \
+  "git log --output=src/app.ts" "src/app.ts"
+assert_targets "#1480 sort -o plural" \
+  "sort -o src/app.ts input.txt" "src/app.ts"
+assert_targets "#1480 yq -i plural" \
+  'yq -i ".a=1" src/app.ts' "src/app.ts"
+assert_targets "#1480 python3 -Bc plural empty" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"" ""
+
+# Read-only neighbours must stay ungated.
+assert_read "#1480 git log --format stays a read" \
+  "git log --format='%h > %s'"
+assert_read "#1480 sort without -o stays a read" \
+  "sort src/app.ts"
+assert_read "#1480 sort -u stays a read" \
+  "sort -u file"
+assert_read "#1480 yq without -i stays a read" \
+  'yq ".a" src/app.ts'
+assert_read "#1480 yq -P stays a read" \
+  "yq -P '.a' file"
+assert_read "#1480 yq filename with -i stays a read" \
+  "yq '.a' my-i.yaml"
+
+# Hold-back parity: new families join _bdw_detects_other_write.
+assert_targets "#1480 w decoy beside git log --output" \
+  "git log --output=src/app.ts; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside sort -o" \
+  "sort -o src/app.ts in.txt; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside yq -i" \
+  "yq -i '.a=1' src/app.ts; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside python3 -Bc (unextracted)" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt" ""
 
 echo ""
 echo "==================================="

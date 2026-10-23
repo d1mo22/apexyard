@@ -2,12 +2,10 @@
 name: pdf
 description: Convert markdown/HTML/BPMN to PDF (pandoc/md-to-pdf/wkhtmltopdf/bpmn-to-image), destination-prompted; graceful-degrades.
 argument-hint: "<input-file> [--no-prompt] [--converter=pandoc|md-to-pdf|wkhtmltopdf] [--destination=workspace|projects|keep|<path>] [--project=<name>]"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /pdf — Export Any Doc to PDF
 
@@ -29,18 +27,18 @@ The skill **asks**, doesn't guess. The 4-option prompt below covers every common
 ## Usage
 
 ```
-/pdf projects/curios-dog/architecture/vision.md
-/pdf workspace/curios-dog/docs/architecture/context.md
-/pdf projects/curios-dog/audits/security/2026-05-19.md
-/pdf projects/curios-dog/journeys/checkout-v2.html
-/pdf projects/curios-dog/processes/onboarding.bpmn
+/pdf projects/sample-app/architecture/vision.md
+/pdf workspace/sample-app/docs/architecture/context.md
+/pdf projects/sample-app/audits/security/2026-05-19.md
+/pdf projects/sample-app/journeys/checkout-v2.html
+/pdf projects/sample-app/processes/onboarding.bpmn
 /pdf <input> --no-prompt                  # use default_destination from config
 /pdf <input> --converter=pandoc           # force a specific converter
 /pdf <input> --destination=workspace      # skip the prompt, write to workspace/<name>/docs/
 /pdf <input> --destination=projects       # skip the prompt, write to projects/<name>/pdfs/
 /pdf <input> --destination=keep           # skip the prompt, keep next to source
 /pdf <input> --destination=/absolute/path/out.pdf  # explicit path
-/pdf <input> --project=curios-dog         # override auto-detected project name
+/pdf <input> --project=sample-app         # override auto-detected project name
 ```
 
 ## Path resolution
@@ -57,6 +55,11 @@ workspace_dir=$(portfolio_workspace_dir)
 Defaults to single-fork (`./projects`, `./workspace`). Don't hardcode literal `projects/` or `workspace/` paths in the bash blocks below — let the helper resolve whichever mode the adopter is in.
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 ### 1. Resolve the input file
 
@@ -93,7 +96,8 @@ The destination prompt needs a project name to fill in. Inference order:
 
 ### 4. Show the destination prompt
 
-Always show this prompt unless `--no-prompt` or `--destination=...` was passed.
+Use `AskUserQuestion` for the destination unless `--no-prompt` or `--destination=...` was passed.
+Recommend the path that fits the document's readers. Use the prompt below only when the harness lacks the tool.
 
 ```
 Where should the PDF land?

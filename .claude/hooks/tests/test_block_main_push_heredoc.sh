@@ -36,6 +36,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/block-main-push.sh"
 LIB_SRC="$SRC_ROOT/.claude/hooks/_lib-extract-push-ref.sh"
@@ -77,6 +82,8 @@ make_sandbox() {
   make_git_repo "$sb" "$primary_branch"
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/block-main-push.sh"
+  cp "$SRC_ROOT/.claude/hooks/_lib-git-global.sh" "$sb/.claude/hooks/"
+  cp "$SRC_ROOT/.claude/hooks/_lib-awk-fallback.sh" "$sb/.claude/hooks/"
   cp "$LIB_SRC"  "$sb/.claude/hooks/_lib-extract-push-ref.sh"
   cp "$LIB_PROTECTED_SRC" "$sb/.claude/hooks/_lib-protected-branches.sh"
   if [ -f "$LIB_STRIP_HEREDOC_SRC" ]; then

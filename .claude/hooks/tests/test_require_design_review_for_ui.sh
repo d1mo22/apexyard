@@ -14,6 +14,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/require-design-review-for-ui.sh"
 LIB_MARKERS="$SRC_ROOT/.claude/hooks/_lib-review-markers.sh"
@@ -117,6 +122,7 @@ make_sandbox() {
   git -C "$sb" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
   mkdir -p "$sb/.claude/hooks" "$sb/.claude/session/reviews"
   cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
+  cp "$(dirname "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh" "$sb/.claude/hooks/_lib-pr-repo.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-ui-paths.sh" "$sb/.claude/hooks/_lib-ui-paths.sh"
@@ -157,6 +163,9 @@ case "\$args" in
   *"pr view"*headRepository*)
     printf '%s\n' "$repo"
     ;;
+  *"pr view"*"--json number"*)
+    printf '%s\n' 77
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -166,10 +175,19 @@ EOF
 run_gate() {
   local sb="$1" command="$2"
   local input
-  input=$(printf '{"tool_input":{"command":"%s"}}' "$command")
+  input=$(jq -nc --arg c "$command" '{tool_input:{command:$c}}')
   ( cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash "$HOOK_SRC" >/dev/null 2>&1 <<< "$input" )
   echo $?
 }
+
+# #1525: only an executable heredoc can make its body a merge candidate.
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+code=$(run_gate "$sb" $'cat <<\'EOF\'\ngh pr merge 315 --repo $R\nEOF')
+assert_eq "#1525 quoted data heredoc passes" "0" "$code"
+code=$(run_gate "$sb" $'bash <<\'EOF\'\ngh pr merge $PR --repo $R\nEOF')
+assert_eq "#1525 bash heredoc variable blocks" "2" "$code"
+rm -rf "$sb"
 
 # Runs the SANDBOX's own copy of the hook, not $HOOK_SRC — so `dirname "$0"`
 # resolves to $sb/.claude/hooks and the hook sources the sandbox's own
@@ -184,6 +202,17 @@ run_gate_sandboxed() {
 }
 
 SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+# B1: the branch PR has a matching design approval. The argv command targets
+# a different PR or a runtime value, so branch approval cannot authorize it.
+for argv_target in "'5'" "os.environ['PR']"; do
+  sb=$(make_sandbox)
+  install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+  printf '%s\n' "$SHA" > "$(review_marker_path "o/r" 77 design "$sb")"
+  code=$(run_gate "$sb" "python3 -c \"import subprocess, os; subprocess.run(['gh','pr','merge',$argv_target])\"")
+  assert_eq "argv merge target $argv_target does not use approved branch PR" "2" "$code"
+  rm -rf "$sb"
+done
 
 echo ""
 echo "B) UI PR + NO marker -> BLOCK (exit 2)"
@@ -561,6 +590,7 @@ for lib in _lib-extract-pr.sh _lib-review-markers.sh _lib-pr-repo.sh; do
     mkdir -p "$sb/.claude/hooks"
     cp "$HOOK_SRC" "$sb/.claude/hooks/require-design-review-for-ui.sh"
     cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
+    cp "$(dirname "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
     cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
     cp "$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh" "$sb/.claude/hooks/_lib-pr-repo.sh"
     chmod +x "$sb/.claude/hooks/require-design-review-for-ui.sh"
@@ -613,6 +643,45 @@ for mode in default posix; do
     FAIL=$((FAIL+1))
   fi
 done
+
+echo ""
+echo "B) UI PR + menu record at head -> ALLOW"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+cat > "$(review_marker_path "o/r" 77 design "$sb")" <<EOF
+sha=${SHA}
+approved_by=user
+skill_version=3
+approval_channel=menu
+approved_at=2026-10-12T14:00:00Z
+approval_summary="Approve design review"
+EOF
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "menu record at head allows" "0" "$code"
+for channel in 'approval_channel="menu"' "approval_channel='menu'"; do
+  marker=$(review_marker_path "o/r" 77 design "$sb")
+  sed "s/^approval_channel=.*/$channel/" "$marker" > "$sb/quoted-marker"
+  cp "$sb/quoted-marker" "$marker"
+  code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+  assert_eq "quoted channel rejects" "2" "$code"
+done
+rm -rf "$sb"
+
+echo ""
+echo "B) UI PR + menu record at another SHA -> BLOCK"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+cat > "$(review_marker_path "o/r" 77 design "$sb")" <<EOF
+sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+approved_by=user
+skill_version=3
+approval_channel=menu
+approved_at=2026-10-12T14:00:00Z
+approval_summary="Approve design review"
+EOF
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "menu record at other sha blocks" "2" "$code"
+rm -rf "$sb"
 
 echo ""
 echo "==================================="

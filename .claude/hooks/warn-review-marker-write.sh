@@ -505,7 +505,12 @@ case "$TOOL_NAME" in
         # `$DIR/mystery.approved` shape) combined with a BSD sed -i
         # mis-extraction would otherwise still slip past both checks.
         IS_EXTRACTION_FRAGILE=0
-        echo "$COMMAND" | grep -qE '\bsed[[:space:]]+([^|;&]*[[:space:]])?-i\b|\bawk[[:space:]]+[^|;&]*-i[[:space:]]+inplace\b' && IS_EXTRACTION_FRAGILE=1
+        # The sed half reads the library's own pattern when it is loaded
+        # (#1414). A private copy here had drifted: it missed `sed -Ei ''`
+        # and `sed --in-place`, which the library now detects. The old
+        # literal is the fallback for a missing library.
+        _rmw_sed_inplace_re="${_BDW_SED_INPLACE_RE:-\\bsed[[:space:]]+([^|;&]*[[:space:]])?-i\\b}"
+        echo "$COMMAND" | grep -qE "${_rmw_sed_inplace_re}|\\bawk[[:space:]]+[^|;&]*-i[[:space:]]+inplace\\b" && IS_EXTRACTION_FRAGILE=1
 
         if [ -n "$WRITE_TARGETS" ]; then
           while IFS= read -r wt; do
@@ -734,9 +739,34 @@ _active_reviewer_allows() {
   # can never be treated as a match.
   [ -n "$MARKER_TYPE" ] || return 1
 
-  [ -f "$ACTIVE_REVIEWER_MARKER" ] || return 1
+  # A typed sub-agent that is not a review agent never gets the marker as a
+  # grant (me2resh/apexyard#1649). The orchestrator and review agents do.
+  if command -v review_caller_class >/dev/null 2>&1; then
+    case "$(review_caller_class "$INPUT" "$MARKER_HOME")" in
+      other-agent) return 1 ;;
+    esac
+  fi
+
+  # One marker per review (#1649) plus the legacy single file. Any file that
+  # matches this write's (repo, pr, role) allows it.
+  local _marker_file
+  if command -v active_reviewer_marker_files >/dev/null 2>&1; then
+    while IFS= read -r _marker_file; do
+      [ -n "$_marker_file" ] || continue
+      _active_marker_file_matches "$_marker_file" && return 0
+    done <<EOF_MARKERS
+$(active_reviewer_marker_files "$MARKER_HOME")
+EOF_MARKERS
+    return 1
+  fi
+  _active_marker_file_matches "$ACTIVE_REVIEWER_MARKER"
+}
+
+_active_marker_file_matches() {
+  local marker_file="$1"
+  [ -f "$marker_file" ] || return 1
   local content
-  content=$(tr -d '[:space:]' < "$ACTIVE_REVIEWER_MARKER" 2>/dev/null)
+  content=$(tr -d '[:space:]' < "$marker_file" 2>/dev/null)
   [ -n "$content" ] || return 1
 
   case "$content" in

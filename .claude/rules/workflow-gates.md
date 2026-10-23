@@ -50,7 +50,7 @@ A small set of **bootstrap-class skills** runs before any portfolio is configure
 
 The list lives at `.claude/project-config.defaults.json` → `ticket.bootstrap_skills`. Adopters replace this array via `.claude/project-config.json` if they have custom bootstrap skills. Config objects merge recursively, while arrays replace the inherited array wholesale, so retain the shipped entries explicitly when extending the list.
 
-**Mechanism:** each bootstrap skill writes its name to `.claude/session/active-bootstrap` on entry and removes the file on completion. The hook reads the marker and exempts skills on the configured list. The `clear-bootstrap-marker.sh` SessionStart hook sweeps stale markers from interrupted sessions so a crashed / killed skill can't leave the exemption open forever.
+**Mechanism:** each bootstrap skill writes its name to the session path from `active_bootstrap_marker_path` on entry and removes the file on completion. The hook reads the marker and exempts skills on the configured list. The `clear-bootstrap-marker.sh` SessionStart hook clears the current session's marker so a crashed / killed skill can't leave the exemption open forever.
 
 ### Out-of-repo exemption (apexyard#883)
 
@@ -62,7 +62,11 @@ The pre-build gate exists to protect **governed content** — the ops fork itsel
 - outside every registered `workspace/<project>`
 - not inside any git repository at all
 
-This is deliberately narrower than "not inside a *registered* repo" — being inside some unrelated, unregistered git repository does **not** exempt a write; only a target with no git repository anywhere in its ancestry qualifies. Symlinks are resolved before judging, so a symlink under `$HOME` that points into a governed tree cannot be used to slip a write past the gate. An unresolvable or ambiguous target (an unextractable Bash write-target, in particular) is never exempted here — it falls straight through to the ticket gate, unchanged. See `require-active-ticket.sh`'s "Out-of-governance exemption" comment block for the full fail-closed reasoning, and `.claude/hooks/tests/test_require_active_ticket_bash.sh` cases 31–38 for the test coverage.
+This is deliberately narrower than "not inside a *registered* repo" — being inside some unrelated, unregistered git repository does **not** exempt a write; only a target with no git repository anywhere in its ancestry qualifies. Any symlink in the target path prevents the exemption, including a dangling link at the final component. An unresolvable or ambiguous target (an unextractable Bash write-target, in particular) is never exempted here — it falls straight through to the ticket gate, unchanged. See `require-active-ticket.sh`'s "Out-of-governance exemption" comment block for the full fail-closed reasoning, and `.claude/hooks/tests/test_require_active_ticket_bash.sh` cases 31–38 for the test coverage.
+
+**Reviewer scratch clone exception (#1402):** A sanctioned reviewer can write inside a standalone git clone under a temporary directory. The clone must have an origin remote. The hook requires this session's active-reviewer marker for Rex, Security, or Architecture review. It checks every write target against the ops fork and managed workspace before allowing the write. Any symlink in the target path prevents the exemption, including a dangling link or a link within the clone. Linked `git worktree add` checkouts and unresolved targets remain gated. See [AgDR-0188](../../docs/agdr/AgDR-0188-reviewer-scratch-clone-ticket-gate.md).
+
+**Reviewer scratchpad exception (#1417):** A sanctioned reviewer can write under this session's scratchpad without a ticket. The hook reads `scratchpad_dir` when the harness sends it. The path must contain this session id as a path segment. It must sit under `/tmp`, `/var/tmp`, `TMPDIR`, or `CLAUDE_CODE_TMPDIR`. It must not be the ops fork or a registered workspace. A `..` segment or a symlink keeps the gate closed. When `scratchpad_dir` is absent, only a temp path that contains this session id as a path segment qualifies. A present value that fails a check does not use that wider rule. See [AgDR-0231](../../docs/agdr/AgDR-0231-reviewer-scratchpad-ticket-gate.md).
 
 See AgDR-0011 + me2resh/apexyard#150 for the full design rationale.
 

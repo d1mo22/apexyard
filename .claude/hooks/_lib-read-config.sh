@@ -32,7 +32,15 @@
 # exactly as before this file existed."
 # ------------------------------------------------------------------------------
 if ! command -v _resolution_cache_current_fingerprint >/dev/null 2>&1; then
-  _READ_CONFIG_RAW_BASH_SOURCE_0="${BASH_SOURCE[0]:-}"
+  # Dash rejects ${BASH_SOURCE[0]:-} as a bad substitution (array subscript).
+  # Expand the array only under bash. Under dash (Linux /bin/sh) or any
+  # non-bash shell, leave the path empty and skip the sibling cache source.
+  # Sourcing still defines config_get. See me2resh/apexyard#1403 and AgDR-0183.
+  if [ -n "${BASH_VERSION:-}" ]; then
+    _READ_CONFIG_RAW_BASH_SOURCE_0="${BASH_SOURCE[0]:-}"
+  else
+    _READ_CONFIG_RAW_BASH_SOURCE_0=""
+  fi
   if [ -n "$_READ_CONFIG_RAW_BASH_SOURCE_0" ]; then
     _read_config_lib_dir="$(cd "$(dirname "$_READ_CONFIG_RAW_BASH_SOURCE_0")" 2>/dev/null && pwd)"
     if [ -n "$_read_config_lib_dir" ] && [ -f "$_read_config_lib_dir/_lib-resolution-cache.sh" ]; then
@@ -62,6 +70,7 @@ _CR=$(printf '\r')
 _CONFIG_CACHE=""
 _CONFIG_WARNED_NO_JQ=""
 _CONFIG_ROOT_CACHE=""
+_CONFIG_ROOT_CACHE_SET=""
 
 # _config_repo_root: resolve the directory that holds .claude/project-config.*.
 #
@@ -83,7 +92,7 @@ _CONFIG_ROOT_CACHE=""
 # Result is cached per-process — the walk is cheap but called by every
 # config_get invocation, so caching matches the _CONFIG_CACHE pattern.
 _config_repo_root() {
-  if [ -n "$_CONFIG_ROOT_CACHE" ]; then
+  if [ -n "$_CONFIG_ROOT_CACHE" ] || [ "${_CONFIG_ROOT_CACHE_SET:-}" = 1 ]; then
     echo "$_CONFIG_ROOT_CACHE"
     return 0
   fi
@@ -276,6 +285,13 @@ _config_load() {
   fi
 
   local defaults overrides
+  # Keep one root lookup for this load, including its cache fingerprint.
+  # A local cache cannot outlive this load or follow a caller into another cwd.
+  # The functions this load calls must not change directory, or the cached
+  # root would no longer match the working directory.
+  local _CONFIG_ROOT_CACHE="$_CONFIG_ROOT_CACHE" _CONFIG_ROOT_CACHE_SET=""
+  [ -n "$_CONFIG_ROOT_CACHE" ] || _CONFIG_ROOT_CACHE=$(_config_repo_root)
+  _CONFIG_ROOT_CACHE_SET=1
   defaults=$(_config_defaults_file)
   overrides=$(_config_overrides_file)
 

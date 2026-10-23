@@ -18,6 +18,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 LIB_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$LIB_DIR/_lib-premium-hook.sh"
 
@@ -70,7 +75,7 @@ test_feature_absent_is_silent_noop() {
 
 # ---------------------------------------------------------------------------
 # Case 1b: feature key absent, default_enabled=true (the retrofit-compat
-# shape used by reindex-on-session-start.sh) -> the flag gate passes, so the
+# shape for hooks that predate features.yaml) -> the flag gate passes, so the
 # payload runs as long as presence also passes. Proves the "no regression
 # for hooks that never had a features.yaml check" design goal.
 # ---------------------------------------------------------------------------

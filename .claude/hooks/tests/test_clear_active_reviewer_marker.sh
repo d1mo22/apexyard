@@ -17,6 +17,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 export APEXYARD_OPS_DISABLE_PIN=1
 
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/clear-active-reviewer-marker.sh"
@@ -227,11 +232,27 @@ case5() {
   rm -rf "$sb"
 }
 
+# -------------------- CASE 6: me2resh/apexyard#1408 — orphaned legacy shared
+# marker is swept when this session has an id (only the session-scoped path is
+# touched otherwise, leaving the bare file behind forever). --------------------
+case6() {
+  local sb; sb=$(make_sandbox_scoped)
+  local legacy="$sb/.claude/session/active-reviewer"
+  printf '%s\n' "synthetic-owner/synthetic-repo#99:rex" > "$legacy"
+  run_hook_sess "$sb" "sess-legacy-sweep" "cleared stale legacy shared active-reviewer marker" "legacy-shared-marker-swept-with-session-id"
+  if [ -f "$legacy" ]; then
+    echo "FAIL [legacy-shared-marker-swept-with-session-id]: legacy marker file still present after sweep" >&2
+    FAIL=$((FAIL+1)); PASS=$((PASS-1))
+  fi
+  rm -rf "$sb"
+}
+
 case1
 case2
 case3
 case4
 case5
+case6
 
 echo ""
 echo "==================================="

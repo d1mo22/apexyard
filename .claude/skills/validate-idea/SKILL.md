@@ -5,9 +5,7 @@ argument-hint: "<IDEA-NNN | project-name | free-form description>"
 allowed-tools: Bash, Read, Write
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /validate-idea — Pre-spec validation gate
 
@@ -37,7 +35,7 @@ See `.claude/rules/role-triggers.md` for the activation protocol.
 
 ```
 /validate-idea IDEA-042              # validate a backlog entry by ID
-/validate-idea curios-dog            # validate a registered project (handover follow-up)
+/validate-idea sample-app            # validate a registered project (handover follow-up)
 /validate-idea AI-powered linter     # free-form description (no IDEA-NNN yet)
 ```
 

@@ -4,9 +4,7 @@ description: Invoke The Contrarian (Naqid) to steelman-then-challenge an idea, f
 argument-hint: "<idea | #N | path/to/doc | 'the plan'>"
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /challenge — Stress-test the premise with The Contrarian
 
@@ -26,7 +24,7 @@ This is the operational tool for the "play devil's advocate" reflex — made a f
 ```
 /challenge add a second database to handle reporting load
 /challenge #345
-/challenge projects/apexbrain/prd.md
+/challenge projects/sample-app/prd.md
 /challenge the plan
 ```
 

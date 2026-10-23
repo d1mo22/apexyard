@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # Validates branch naming convention before push.
 # Format: {type}/{TICKET-ID}-{description}
 #
@@ -6,19 +7,29 @@
 # .claude/project-config.json (.branch.type_whitelist). Defaults ship at
 # .claude/project-config.defaults.json. See apexyard#109 for the schema.
 
-INPUT=$(cat)
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
+INPUT="$_GIT_GATE_INPUT"
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR/_lib-git-global.sh"
+fi
 
 if [ -z "$COMMAND" ]; then
   . "$(dirname "$0")/_lib-fail-closed-json.sh"
-  if raw_payload_command_matches "$INPUT" 'git[[:space:]]+push'; then
+  _branch_pat='git[[:space:]]+push'
+  if command -v git_subcommand_payload_pattern >/dev/null 2>&1; then
+    _branch_pat="$(git_subcommand_payload_pattern push)"
+  fi
+  if raw_payload_command_matches "$INPUT" "$_branch_pat"; then
     echo "BLOCKED: branch-name hook cannot parse this push command. Restore jq and retry." >&2
     exit 2
   fi
   exit 0
 fi
-
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Only check on git push. This presence check MUST run against the RAW,
 # unfiltered command — never against heredoc-stripped text. A security
@@ -31,7 +42,9 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # _lib-strip-heredoc.sh's governance comment and
 # docs/agdr/AgDR-0113-heredoc-stripper-additive-only.md for the incident and
 # the additive-(safe)-vs-subtractive-(dangerous) framing that fixes it.
-if ! echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  command_has_git_subcommand "$COMMAND" push || exit 0
+elif ! echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
   exit 0
 fi
 
@@ -110,27 +123,36 @@ if [ -f "$HOOK_DIR/_lib-extract-push-ref.sh" ]; then
   # nothing for a branch-name validator to check.
   SCAN_LAST_REF=""
   if is_tag_push "$COMMAND"; then
-    STRIPPED_FOR_SCAN=$(echo "$COMMAND" | sed 's/[[:space:]][0-9]*[>|].*$//')
+    # #1831: walk each push invocation past its redirections. The old
+    # segment scan cut the command at the first redirection.
     while IFS= read -r SEGMENT; do
       [ -z "$SEGMENT" ] && continue
       HAS_EVIDENCE=0
-      if echo "$SEGMENT" | grep -qE '\s--tags(\s|$)' \
-         || echo "$SEGMENT" | grep -qE '\stag\s+\S' \
-         || echo "$SEGMENT" | grep -qE 'refs/tags/'; then
+      if _push_invocation_has_tag_evidence "$SEGMENT"; then
         HAS_EVIDENCE=1
       fi
-      [ "$HAS_EVIDENCE" = "1" ] && continue
+      SEG_REF=""
+      SEG_RC=0
       if declare -F _extract_push_ref_core > /dev/null 2>&1; then
-        SEG_REF=$(_extract_push_ref_core "$SEGMENT")
-        [ -n "$SEG_REF" ] && SCAN_LAST_REF="$SEG_REF"
+        SEG_REF=$(_extract_push_ref_core "$SEGMENT") || SEG_RC=$?
       fi
-    done < <(echo "$STRIPPED_FOR_SCAN" | grep -oE '\bgit\s+push\b[^|;&]*')
+      if [ "$SEG_RC" -eq 3 ]; then
+        push_ref_unresolved_message >&2
+        exit 2
+      fi
+      # Explicit ORBIT refs must reach the records command check (#1673).
+      if [ "$HAS_EVIDENCE" = "1" ]; then
+        case "$SEG_REF" in orbit/*) ;; *) continue ;; esac
+      fi
+      [ -n "$SEG_REF" ] && SCAN_LAST_REF="$SEG_REF"
+    done < <(_each_push_invocation "$COMMAND")
 
     if [ -z "$SCAN_LAST_REF" ]; then
       exit 0
     fi
   fi
 
+  PUSH_REF_RC=0
   if [ -n "$SCAN_LAST_REF" ]; then
     # An evidence-less, ref-bearing occurrence was found by the
     # untrusted-tag-signal scan above -- validate it directly rather than
@@ -138,7 +160,12 @@ if [ -f "$HOOK_DIR/_lib-extract-push-ref.sh" ]; then
     # would repeat the same hijack).
     PUSH_REF="$SCAN_LAST_REF"
   else
-    PUSH_REF=$(extract_push_ref "$COMMAND")
+    PUSH_REF=$(extract_push_ref "$COMMAND") || PUSH_REF_RC=$?
+  fi
+  # #1831: fail closed when the push words cannot be read.
+  if [ "$PUSH_REF_RC" -eq 3 ]; then
+    push_ref_unresolved_message >&2
+    exit 2
   fi
 
   # Fail closed rather than silently falling back to local HEAD when the
@@ -150,7 +177,12 @@ if [ -f "$HOOK_DIR/_lib-extract-push-ref.sh" ]; then
   # thing; blocking and asking the operator to split the call (the ticket's
   # own mitigation) is the safe direction. See me2resh/apexyard#1075.
   if [ -z "$PUSH_REF" ]; then
-    RAW_REF=$(_extract_push_ref_core "$COMMAND")
+    RAW_REF_RC=0
+    RAW_REF=$(_extract_push_ref_core "$COMMAND") || RAW_REF_RC=$?
+    if [ "$RAW_REF_RC" -eq 3 ]; then
+      push_ref_unresolved_message >&2
+      exit 2
+    fi
     if [ -n "$RAW_REF" ]; then
       cat >&2 <<MSG
 BLOCKED: Cannot safely determine the push destination for this command.
@@ -174,42 +206,28 @@ MSG
   fi
 fi
 
-# When the push has no explicit source ref (no-arg `git push`, `git push
-# origin` relying on upstream tracking), we fall back to the current branch.
-# That fallback MUST be resolved against the repo the command actually runs
-# in — not the hook's own cwd. The harness fires this PreToolUse hook BEFORE
-# the shell executes the command, so a `cd <repo> && git push …` prefix has
-# NOT yet changed the working dir: the hook's cwd is still the ops fork (on,
-# e.g., `dev`). Without re-rooting, the fallback reads the ops-fork's branch
-# and false-blocks a push for a *different* managed repo (e.g. "Branch 'dev'
-# missing ticket ID"). Same class as #669/#687 for the merge gates + arch-PR
-# hook. See me2resh/apexyard#693.
-#
-# Re-root via pr_cmd_cd_target from _lib-pr-repo.sh: if the command begins
-# with `cd <path> && …`, resolve the fallback branch with `git -C <path>`.
-# When there's no leading `cd` (or <path> isn't a git tree), this is a no-op
-# and the fallback stays byte-for-byte equivalent to the pre-#693 behaviour.
+# Resolve implicit pushes in the repo selected by cd and git options.
+# The invocation visitor blocks unresolved targets before this check.
 BRANCH_DIR=""
-if [ -f "$HOOK_DIR/_lib-pr-repo.sh" ]; then
-  # shellcheck disable=SC1090,SC1091
-  . "$HOOK_DIR/_lib-pr-repo.sh"
-  CD_TARGET=$(pr_cmd_cd_target "$COMMAND")
-  if [ -n "$CD_TARGET" ]; then
-    CD_TOPLEVEL=$(git -C "$CD_TARGET" rev-parse --show-toplevel 2>/dev/null)
-    if [ -n "$CD_TOPLEVEL" ]; then
-      BRANCH_DIR="$CD_TOPLEVEL"
+PAYLOAD_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null || true)
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  git_prepare_invocation "$COMMAND" push "$PAYLOAD_CWD"
+  if [ -n "${GIT_DASH_C:-}" ]; then
+    DASH_C_TOP=$(git -C "$GIT_DASH_C" rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$DASH_C_TOP" ]; then
+      BRANCH_DIR="$DASH_C_TOP"
     fi
-    # If <path> is not a readable git tree, fall through with BRANCH_DIR empty
-    # — the fallback uses the hook's own cwd, no worse than pre-#693.
   fi
 fi
 
 if [ -n "$PUSH_REF" ]; then
   CURRENT_BRANCH="$PUSH_REF"
+elif [ -n "${GIT_DASH_C:-}${_GIT_RAW_GIT_DIR:-}${_GIT_RAW_WORK_TREE:-}" ]; then
+  CURRENT_BRANCH=$(git_target branch --show-current 2>/dev/null)
 elif [ -n "$BRANCH_DIR" ]; then
   CURRENT_BRANCH=$(git -C "$BRANCH_DIR" branch --show-current 2>/dev/null)
 else
-  CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+  CURRENT_BRANCH=$(if command -v git_target >/dev/null 2>&1; then git_target branch --show-current; else git branch --show-current; fi 2>/dev/null)
 fi
 
 # Allow trunk and shared integration branches.
@@ -225,9 +243,9 @@ fi
 # list. See me2resh/apexyard#888.
 REPO_ROOT_FOR_TRUNK=$(git rev-parse --show-toplevel 2>/dev/null)
 TRUNK_BRANCHES=""
-if [ -n "$REPO_ROOT_FOR_TRUNK" ] && [ -f "$REPO_ROOT_FOR_TRUNK/.claude/hooks/_lib-read-config.sh" ]; then
+if [ -n "$REPO_ROOT_FOR_TRUNK" ] && [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
-  . "$REPO_ROOT_FOR_TRUNK/.claude/hooks/_lib-read-config.sh"
+  . "$HOOK_DIR/_lib-read-config.sh"
   TRUNK_BRANCHES=$(config_get '.branch.trunk_whitelist[]')
 fi
 # Fallback if config unavailable (jq missing, standalone install, no config
@@ -259,6 +277,35 @@ if echo "$CURRENT_BRANCH" | grep -qE '^sync/main-to-dev-after-v[0-9]+\.[0-9]+\.[
   exit 0
 fi
 
+# Allow dependency-bot branches (me2resh/apexyard#1362). Dependabot and Renovate
+# name their own branches and cannot be told to use {type}/{TICKET}-{desc};
+# there is also no ticket to reference at the moment the bot opens the PR.
+# Without this, a maintainer cannot push anything to a bot branch — not even
+# the changelog fragment and ticket reference the repository's own gates demand
+# before the PR can merge — so the bot PR becomes unmergeable by construction.
+#
+# CI already made this call: .github/workflows/pr-title-check.yml exempts
+# `dependabot/`, `sync/` and `release/` head refs (#588), and states that its
+# pattern is "intentionally aligned with the local hooks ... so anything that
+# passes the hooks also passes this CI check". The hook exempted `sync/` and
+# `release/` but not the bot prefixes, so the two disagreed.
+#
+# Deliberately narrow: the prefixes are anchored and the rest of the name is
+# the bot's to choose. Human branches are unaffected, and every other gate
+# (ticket-first, secrets, commit format, the merge gates) still applies to
+# whatever is pushed. The exemption is about the branch NAME only.
+#
+# The trailing `[^/]` requires a non-empty first segment. A bare `dependabot/`
+# is not a ref git accepts, so exempting it would widen the surface for nothing.
+#
+# `.github/workflows/pr-title-check.yml` carries the same prefix list and the
+# same requirement. The two must stay in step (#1362): a prefix this hook
+# exempts but that check does not lets a bot PR pass the local push gate and
+# then fail CI on a title it was never going to carry.
+if echo "$CURRENT_BRANCH" | grep -qE '^(dependabot|renovate)/[^/]'; then
+  exit 0
+fi
+
 # Allow the two branches /handover prescribes for its opt-in writes INTO AN
 # ADOPTED REPO (me2resh/apexyard#1161). Steps 8.5 and 8.6 push `docs/agents-md`
 # (the generated AGENTS.md) and `docs/apexyard-badge` (the README badge) into
@@ -276,12 +323,32 @@ if echo "$CURRENT_BRANCH" | grep -qE '^docs/(agents-md|apexyard-badge)$'; then
   exit 0
 fi
 
+# Exempt by NAME and content together. Fail closed (#1673).
+if [ -f "$HOOK_DIR/_lib-orbit-records.sh" ]; then
+  # shellcheck source=./_lib-orbit-records.sh
+  . "$HOOK_DIR/_lib-orbit-records.sh"
+  if orbit_records_branch_shape "$CURRENT_BRANCH"; then
+    if orbit_push_command_simple "$COMMAND" &&
+       orbit_records_only "${BRANCH_DIR:-.}" "$CURRENT_BRANCH" "$TRUNK_BRANCHES"; then
+      exit 0
+    fi
+    cat >&2 <<MSG
+BLOCKED: This branch uses the orbit/ records shape.
+Allow this shape only when every changed file is under docs/orbit/.
+${ORBIT_RECORDS_REASON}
+Use the normal shape {type}/{TICKET-ID}-{description}, such as feature/GH-45-add-thing.
+Run git fetch first when the base looks stale.
+MSG
+    exit 2
+  fi
+fi
+
 # Load the branch-type whitelist from project config.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 # shellcheck source=./_lib-read-config.sh
-if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.claude/hooks/_lib-read-config.sh" ]; then
+if [ -n "$REPO_ROOT" ] && [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
-  . "$REPO_ROOT/.claude/hooks/_lib-read-config.sh"
+  . "$HOOK_DIR/_lib-read-config.sh"
   TYPES=$(config_get '.branch.type_whitelist[]' | paste -sd'|' -)
 fi
 # Fallback if config unavailable (jq missing, standalone install, etc.)
@@ -296,9 +363,9 @@ fi
 # override `.tracker.id_pattern` in project-config.json. See AgDR-0033 and
 # `.claude/hooks/_lib-tracker.sh`.
 TRACKER_ID_PATTERN=""
-if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.claude/hooks/_lib-tracker.sh" ]; then
+if [ -n "$REPO_ROOT" ] && [ -f "$HOOK_DIR/_lib-tracker.sh" ]; then
   # shellcheck disable=SC1090,SC1091
-  . "$REPO_ROOT/.claude/hooks/_lib-tracker.sh"
+  . "$HOOK_DIR/_lib-tracker.sh"
   TRACKER_ID_PATTERN=$(tracker_id_pattern)
 fi
 
@@ -362,3 +429,17 @@ MSG
 fi
 
 exit 0
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body block "$_GIT_GATE_INPUT" push
+  exit $?
+fi
+_git_gate_body

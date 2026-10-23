@@ -1,0 +1,109 @@
+name: Scaffold starter gates
+
+on:
+  pull_request:
+    paths:
+      - "topologies/typescript-nextjs/**"
+      - ".claude/skills/scaffold/**"
+      - ".github/workflows/scaffold-starter-gates.yml"
+      - ".claude/hooks/tests/fixtures/scaffold/starter-faults/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scaffold-starter-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: topologies/typescript-nextjs/starter
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v5.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: topologies/typescript-nextjs/starter/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: bash scripts/exact-pins.sh
+      - run: bash scripts/run-gate.sh lint
+      - run: bash scripts/run-gate.sh typecheck
+      - run: bash scripts/run-gate.sh build
+      - run: bash scripts/run-gate.sh coverage
+      - run: bash scripts/run-gate.sh audit
+      - run: node scripts/migrate.mjs
+      - run: node scripts/seed.mjs
+      - run: node scripts/reset.mjs
+
+  fault:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: topologies/typescript-nextjs/starter
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [lint, typecheck, build, coverage, audit]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v5.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: topologies/typescript-nextjs/starter/package-lock.json
+      - name: Apply seeded fault
+        run: patch -p1 --forward --input="${GITHUB_WORKSPACE}/.claude/hooks/tests/fixtures/scaffold/starter-faults/${{ matrix.gate }}.patch"
+      - name: Require a successful install and a failing gate
+        env:
+          GATE: ${{ matrix.gate }}
+        run: bash "${GITHUB_WORKSPACE}/.claude/hooks/tests/fixtures/scaffold/starter-faults/expect-fault.sh" bash scripts/run-gate.sh "$GATE"
+
+  generated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v5.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: topologies/typescript-nextjs/starter/package-lock.json
+      - name: Generate the floor and run its gates
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            printf 'RUNNER_TEMP is unset\n' >&2
+            exit 1
+          fi
+          target="${RUNNER_TEMP}/scaffold-starter-generated"
+          rm -rf "$target"
+          bash .claude/skills/scaffold/lib/generate.sh \
+            --spec .claude/hooks/tests/fixtures/scaffold/good.json \
+            --target "$target" \
+            --name scaffold-starter-generated
+          cd "$target" || exit 1
+          npm ci --ignore-scripts
+          for script in \
+            scripts/ci/lint.sh \
+            scripts/ci/typecheck.sh \
+            scripts/ci/test.sh \
+            scripts/ci/build.sh \
+            scripts/ci/audit.sh \
+            scripts/ci/coverage-gate.sh \
+            scripts/exact-pins.sh
+          do
+            bash "$script"
+            printf '%s exit_code=0\n' "$script"
+          done

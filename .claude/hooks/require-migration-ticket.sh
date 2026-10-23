@@ -44,17 +44,41 @@
 # every migration-shaped target independently (apexyard#1182), so a command
 # can name several projects without one representative authorising the rest.
 
+# Hook dir + shared libs. Sourced before the first meta-exempt check so
+# Write/Edit targets and Bash targets use the same helpers (AgDR-0219).
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# _resolve_real_path (#1181): shared realpath -m helper. Sourced early so
+# path exemptions can canonicalize before /var vs /private/var compares.
+if [ -f "$HOOK_DIR/_lib-path-resolve.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOK_DIR/_lib-path-resolve.sh"
+else
+  # Deliberate degrade — see the longer comment near the former late-source
+  # site below. Empty resolve fails closed for exemptions (gated, not exempt).
+  _resolve_real_path() { return 0; }
+fi
+
+if [ -f "$HOOK_DIR/_lib-ticket-path-exemptions.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOK_DIR/_lib-ticket-path-exemptions.sh"
+fi
+
 # Exempt meta / docs / example files — these never need a migration
 # ticket regardless of path. Applied PER TARGET (not just once against
 # the first extracted target) so a meta-exempt target can't shadow a
 # genuinely migration-shaped target named later in the same command.
+#
+# Uses the shared helper so exemptions match the file's OWN worktree top
+# (AgDR-0219 / #1531), same as require-active-ticket.sh. Absolute
+# */.claude/* arms must not fire on a path that still contains a linked
+# worktree prefix under the main clone.
 _rmt_is_meta_exempt() {
-  case "$1" in
-    */.claude/*|*/.claude|*/docs/*|*/docs) return 0 ;;
-    *.md|*.example) return 0 ;;
-  esac
-  # Note: `*/projects/*/docs/*` is subsumed by `*/docs/*` above (shell case
-  # `*` crosses `/`), so no separate arm is needed.
+  if command -v ticket_path_is_meta_exempt >/dev/null 2>&1; then
+    ticket_path_is_meta_exempt "$1" migration
+    return $?
+  fi
+  # Lib missing (partial checkout): fail closed — do not path-exempt.
   return 1
 }
 
@@ -92,14 +116,21 @@ if [ "$TOOL_NAME" = "Bash" ]; then
   COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
   [ -z "$COMMAND" ] && exit 0
 
-  HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
   if [ -f "$HOOK_DIR/_lib-detect-bash-write.sh" ]; then
     # shellcheck source=/dev/null
     . "$HOOK_DIR/_lib-detect-bash-write.sh"
+    for fn in _run_awk_or_fallback join_shell_continuations _join_shell_continuations_fallback; do
+      if ! declare -F "$fn" >/dev/null 2>&1; then
+        printf 'BLOCKED: missing required awk helper %s. Restore _lib-awk-fallback.sh and retry.\n' "$fn" >&2
+        exit 2
+      fi
+    done
     if ! bash_command_appears_to_write "$COMMAND"; then
       exit 0
     fi
-    BASH_TARGETS=$(bash_extract_write_targets "$COMMAND")
+    # "all": never hold back a sed `w` target. This gate exits 0 on an
+    # empty list, so a held-back migration file would pass (#1502).
+    BASH_TARGETS=$(bash_extract_write_targets "$COMMAND" all)
   else
     # Library missing — fall back to no-op rather than bricking the hook.
     exit 0
@@ -123,29 +154,8 @@ if [ "$TOOL_NAME" != "Bash" ]; then
 fi
 
 # --------- Discover ops root ---------
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-# _resolve_real_path (#1181): shared realpath -m helper, composed after the
-# lexical collapse in _rmt_normalise_target below, and used again to
-# canonicalise the WORKSPACE_DIR/OPS_ROOT anchors further down. Sourced from
-# the single shared definition (Rex finding on PR #1087) rather than a
-# private copy -- require-active-ticket.sh already sources the same file.
-if [ -f "$HOOK_DIR/_lib-path-resolve.sh" ]; then
-  # shellcheck source=/dev/null
-  . "$HOOK_DIR/_lib-path-resolve.sh"
-else
-  # Deliberate degrade, mirroring require-active-ticket.sh's own handling of
-  # the same missing-lib case: this should not happen in a normal clone,
-  # since the file is tracked right next to this one. Returning empty here
-  # is read by TWO callers, each with its own fallback: the composed
-  # _rmt_normalise_target falls back to its lexical-only result, and the
-  # OPS_ROOT_REAL/WORKSPACE_DIR_REAL anchor block further down falls back to
-  # the raw, uncanonicalised OPS_ROOT/WORKSPACE_DIR (its own `|| ANCHOR="$RAW"`
-  # line, not this one). Both degrades land on exactly this gate's pre-#1181
-  # behaviour, rather than crashing the hook or exempting a write it should
-  # still gate.
-  _resolve_real_path() { return 0; }
-fi
+# HOOK_DIR and _lib-path-resolve.sh were sourced at the top of this file
+# (before the first meta-exempt check). Reuse them here.
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 OPS_ROOT=""
@@ -177,18 +187,21 @@ MARKER_HOME="${MARKER_HOME:-.}"
 # Used by the sourced shared marker resolver below.
 # shellcheck disable=SC2034
 WORKSPACE_DIR="$OPS_ROOT/workspace"
+# The tree validation takes an absolute workspace dir only.
+TREE_WS="$OPS_ROOT/workspace"
 
 if [ -n "$OPS_ROOT" ] && [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ] && [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck source=/dev/null
   . "$HOOK_DIR/_lib-read-config.sh"
   # shellcheck source=/dev/null
   . "$HOOK_DIR/_lib-portfolio-paths.sh"
-  resolved_ws=$(portfolio_workspace_dir 2>/dev/null)
-  if [ -n "$resolved_ws" ]; then
-    # Used by the sourced shared marker resolver below.
-    # shellcheck disable=SC2034
-    WORKSPACE_DIR="$resolved_ws"
-  fi
+  portfolio_resolve_into_vars
+  # shellcheck disable=SC2034
+  [ -z "${_PP_WS:-}" ] || WORKSPACE_DIR="$_PP_WS"
+  # A relative value means the hook runs outside the fork. Keep the default.
+  case "${_PP_WS:-}" in
+    /*) TREE_WS="$_PP_WS" ;;
+  esac
 fi
 
 # Marker resolution is shared with require-active-ticket.sh. Load it only after
@@ -196,6 +209,8 @@ fi
 if [ -f "$HOOK_DIR/_lib-active-ticket.sh" ]; then
   # shellcheck source=/dev/null
   . "$HOOK_DIR/_lib-active-ticket.sh"
+  # The roots are resolved above, so the library needs no init of its own.
+  active_ticket_set_context "$OPS_ROOT" "$TREE_WS" "$MARKER_HOME" "$WORKSPACE_DIR"
 fi
 
 # --------- Load project-config overrides ---------
@@ -213,8 +228,31 @@ fi
 # Defaults cover the common tool / convention set. Patterns use shell
 # glob semantics (`*` crosses `/` inside case). Add to this list sparingly
 # — false positives on non-migration files block productive edits.
+#
+# _rmt_path_for_migration_match PATH (#1483)
+# Match-only form of a write target. Default patterns are `*/`-anchored
+# (`*/migrations/*`), so a relative `migrations/001.sql` misses every arm
+# while `./migrations/001.sql` matches. Prefix a bare relative path with
+# `./` so both spellings hit the same arms. Absolute and `~/` paths stay
+# unchanged. Do NOT collapse `.` / `..` here: collapsing would drop the
+# `migrations` segment from spellings like `migrations/../1.sql` and
+# loosen a write that blocks today (AgDR-0193).
+_rmt_path_for_migration_match() {
+  case "$1" in
+    /*|~*|./*) printf '%s' "$1" ;;
+    *) printf './%s' "$1" ;;
+  esac
+}
+
 is_migration_path() {
   local path="$1"
+  local match bare
+
+  match=$(_rmt_path_for_migration_match "$path")
+  bare="$path"
+  case "$bare" in
+    ./*) bare="${bare#./}" ;;
+  esac
 
   # Project-configured patterns take precedence if any
   if [ -n "$CUSTOM_PATHS" ]; then
@@ -226,16 +264,22 @@ is_migration_path() {
       case "$path" in
         $pat) return 0 ;;
       esac
+      # Also try the ./ -stripped relative form so an adopter pattern like
+      # `src/db/**` still matches a harness that supplies `./src/db/...`.
+      # shellcheck disable=SC2254
+      case "$bare" in
+        $pat) return 0 ;;
+      esac
     done <<< "$CUSTOM_PATHS"
     # When custom patterns are set, don't fall through to defaults —
     # projects that override are saying "only these paths"
     return 1
   fi
 
-  # Default patterns.
+  # Default patterns — compare the match form (#1483).
   # Note: shell case `*` crosses `/`, so `*/migrations/*.sql` already covers
   # nested paths like `*/migrations/<sub>/file.sql` — no separate arm needed.
-  case "$path" in
+  case "$match" in
     # SQL migrations anywhere under a `migrations/` directory
     */migrations/*.sql) return 0 ;;
     # `migrate-*.ts` / `.js` / `.py` / `.sql` anywhere
@@ -504,9 +548,38 @@ MSG
   exit 2
 fi
 
+# Advisory only (AgDR-0257 / #1533): warn when the marker belongs to another
+# session or another branch. Never blocks on the mismatch alone.
+# Resolve the tree from the nearest existing ancestor of the edited path so
+# a not-yet-created migration directory still yields a real branch. When no
+# ancestor is usable, pass an empty tree: the warn helper skips the branch
+# check and does not consume a claim.
+if command -v active_ticket_warn_if_mismatch >/dev/null 2>&1; then
+  _rmt_warn_tree="${AT_TREE:-}"
+  if [ -z "$_rmt_warn_tree" ] && [ -n "${FILE_PATH:-}" ]; then
+    _rmt_warn_cand="$FILE_PATH"
+    while [ -n "$_rmt_warn_cand" ] && [ "$_rmt_warn_cand" != / ]; do
+      if [ -d "$_rmt_warn_cand" ]; then
+        _rmt_warn_tree=$(cd "$_rmt_warn_cand" 2>/dev/null && pwd) || _rmt_warn_tree=""
+        break
+      fi
+      _rmt_warn_cand=$(dirname "$_rmt_warn_cand")
+    done
+  fi
+  active_ticket_warn_if_mismatch "$MARKER" "${_rmt_warn_tree:-}" "${OPS_ROOT:-}" || true
+fi
+
 # --------- Parse marker for repo + issue number ---------
-TICKET_REPO=$(grep -E '^repo=' "$MARKER" | head -1 | cut -d= -f2-)
-TICKET_NUM=$(grep -E '^number=' "$MARKER" | head -1 | cut -d= -f2-)
+# First match of each key (AgDR-0257). Prefer the shared reader when present.
+if command -v active_ticket_read_field >/dev/null 2>&1; then
+  active_ticket_read_field "$MARKER" repo || true
+  TICKET_REPO="$REPLY"
+  active_ticket_read_field "$MARKER" number || true
+  TICKET_NUM="$REPLY"
+else
+  TICKET_REPO=$(grep -E '^repo=' "$MARKER" | head -1 | cut -d= -f2-)
+  TICKET_NUM=$(grep -E '^number=' "$MARKER" | head -1 | cut -d= -f2-)
+fi
 
 if [ -z "$TICKET_REPO" ] || [ -z "$TICKET_NUM" ]; then
   cat >&2 <<MSG
@@ -583,13 +656,30 @@ if [ "$TICKET_KIND" = "none" ]; then
   exit 0
 fi
 
+# Capture the tracker CLI's own stderr instead of discarding it, so the
+# fail-closed block below can name the real cause (#1336). This gate performs a
+# single lookup with no upstream fallback, so the captured text always belongs
+# to the lookup that failed. The gh fallback branch captures the same way — it
+# reaches the identical block path, so discarding its stderr would leave
+# exactly the gap this fix closes.
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on the lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
+
 if command -v tracker_view >/dev/null 2>&1; then
-  ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TICKET_REPO" 2>/dev/null)
+  ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TICKET_REPO" 2>"$TRACKER_ERR")
 else
   # Library missing (should not happen in a real fork) — fall back to gh so the
   # gate still functions on a GitHub tracker rather than bricking, normalising
   # to the same shape tracker_view emits (labels as a flat string array).
-  ISSUE_JSON=$(gh issue view "$TICKET_NUM" --repo "$TICKET_REPO" --json state,title,url,labels,body 2>/dev/null \
+  ISSUE_JSON=$(gh issue view "$TICKET_NUM" --repo "$TICKET_REPO" --json state,title,url,labels,body 2>"$TRACKER_ERR" \
     | jq -c '{state,title,url,labels:((.labels // []) | map(.name)),body}' 2>/dev/null)
 fi
 
@@ -608,6 +698,10 @@ warrants a hard stop.) If your tracker is untracked, set tracker.kind=none.
 Check your tracker auth (e.g. gh auth status / glab auth status), or run
 /migration to create a new ticket.
 MSG
+  if [ -s "$TRACKER_ERR" ]; then
+    echo "Tracker CLI said:" >&2
+    sed 's/^/  /' "$TRACKER_ERR" >&2
+  fi
   exit 2
 fi
 

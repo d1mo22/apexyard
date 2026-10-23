@@ -5,9 +5,7 @@ argument-hint: "<rex|hakim|tariq> [--corpus <path>] [--check-only]"
 allowed-tools: Bash, Read, Glob, Grep, Agent
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /eval-agents — Review-Agent Eval Harness
 
@@ -28,13 +26,39 @@ Full rationale: [AgDR-0089](../../../docs/agdr/AgDR-0089-eval-agents-methodology
 ```
 /eval-agents rex                                            # run against the seeded starter corpus
 /eval-agents hakim --corpus docs/eval-agents/corpus/hakim.json
-/eval-agents tariq --corpus my-corpus.json                  # tariq has no starter corpus — required
+/eval-agents tariq --corpus my-corpus.json                  # Use a custom Tariq corpus.
 /eval-agents rex --check-only                                # validate corpus schema only, no spawns
 ```
 
 `<agent>` is one of `rex`, `hakim`, `tariq` — the three review agents that produce a verdict over a diff and share the `APPROVED / CHANGES REQUESTED / COMMENT` vocabulary. **Naqid is out of scope for v1** (it challenges premises, not diffs — no defect-set structure to score against; see AgDR-0089 § Decision point 7).
 
-**`--suggest-entries` is not implemented.** #833 scoped an optional corpus-growth-assist mode that would mine `gh` PR/review history for re-review disagreements and escaped-bug patterns (the same shape `docs/eval-agents/README.md` § "Growing the corpus" describes doing by hand) and propose candidate entries for human confirmation. Investigating this against #833's "keep it small or split it out" instruction: `docs/spike-825/judge_calibration.py` — the file #833 named as the source to lift mining logic from — turns out to hold a hand-curated data table of 19 review units the spike's author read and classified manually, not a reusable scan/detect routine; there is no existing mining logic to lift. Building a real one (walking PR review threads via `gh api`, correlating approve→later-CHANGES_REQUESTED and merge→next-commit-touches-same-files patterns, then shaping matches into draft `ground_truth_defects`) is a genuine new feature, not a hardening follow-up, so it's left for a separate ticket rather than folded in here.
+**`--suggest-entries` is not a mode of this skill.** #833 left corpus mining for a separate ticket. #1440 adds it as a separate, read-only script. See "Mining candidate entries" below.
+
+## Mining candidate entries
+
+`lib/mine_disagreements.py` finds candidate Rex MISS entries in the review history of merged PRs. It prints candidates for a human to adjudicate. It never writes a corpus file.
+
+```
+python3 .claude/skills/eval-agents/lib/mine_disagreements.py --repo <owner/repo> [--limit 60] [--format json|markdown]
+```
+
+The script mines one shape:
+
+- Rex returned APPROVED on a commit.
+- Hakim or Tariq returned CHANGES REQUESTED or BLOCKING on the identical commit.
+
+That shape is the `independent_review` oracle (AgDR-0089). The script does not mine the reverse shape (Hakim or Tariq APPROVED, Rex CHANGES). Rex's scope is a superset of Hakim's scope, because Rex also enforces the writing standard. So the reverse shape mostly shows two reviewers that do different jobs. The #1440 hand adjudication found zero Hakim misses in five reverse-shape candidates.
+
+How the script reads a review:
+
+1. It gets the reviewer from the section header (`## Code Review`, `## Security Review`, `## Design Review`). All agents post under one account, so the GitHub author does not identify the agent.
+2. It reads the verdict only from the `### Verdict` section. When no such heading exists, it reads a `**Verdict**:` line. It never searches the full body, because recap prose caused all false positives in the #1440 probe. The verdict line must start with a verdict word. A line such as "No blocking findings remain." gives an unknown verdict.
+3. The miner uses the `**Commit**:` line first, then the `Reviewed commit:` footer. It uses the API `commit_id` only when the body names no commit. It ignores "Last reviewed commit:" and "Last-reviewed commit:".
+4. It groups the reviews by commit. A short SHA of 7 or more characters joins the group of the full SHA that it prefixes. It reports each commit that has the mined shape.
+
+Each candidate has a partial `draft_entry` and an `evidence` block with links to the approval and the challenge. The draft has no `ground_truth_defects` and no `recorded_verdict.was_justified`. Thus `validate-corpus.sh` rejects a raw paste. To promote a candidate, follow `docs/eval-agents/README.md` § "Growing the corpus".
+
+The script uses only read calls: one PR list call and one GET call to the reviews API for each PR. It reads PR reviews only. It does not read PR conversation comments.
 
 ## Safety — the agent-under-test never touches a live PR
 
@@ -74,7 +98,8 @@ if [ ! -f "$CORPUS_PATH" ]; then
 fi
 ```
 
-`tariq.json` does not exist in the seeded set (see `docs/eval-agents/README.md`) — running `/eval-agents tariq` without `--corpus` exits 3 with the message above, same graceful-degrade shape as `/mutation-test` and `/pdf` on a missing dependency.
+`tariq.json` contains 8 seeded entries (see `docs/eval-agents/README.md`).
+`/eval-agents tariq` uses this starter corpus unless the operator supplies `--corpus`.
 
 ### Step 2 — Validate corpus schema
 
@@ -173,6 +198,8 @@ Review this diff and report your findings and verdict.
 This wording is deliberate (#833, Hakim's security review of #828): telling the agent-under-test "don't do the mandatory thing" *contradicts* its own HARD STOP instead of overriding it, which leaves the two instructions in tension and relies on the sanitized-out PR number to break the tie. Explicitly suspending the mandate removes the tension — the agent isn't refusing a required action, it's correctly recognizing the requirement doesn't apply to this run.
 
 Capture the sub-agent's full returned text as `AGENT_OUTPUT`.
+
+**Option: read-only source access (#1815).** Some defects need the source, for example a count to recount or a set of settings to check. For such an entry, run the reviewer with the Opus CLI in place of the `Agent` tool. Give it only Read, Grep and Glob over a sanitized source snapshot of the reviewed commit, built by `lib/source-snapshot.sh`. The reviewer gets no shell and no path outside its run folder. The full protocol and the list of entries that used it are in [`docs/eval-agents/README.md`](../../../docs/eval-agents/README.md) § "Read-only source access (option)". Record in the report which entries used the option.
 
 #### 3e. Contamination check (safety backstop) — snapshot-diff is authoritative, text-scan is secondary
 
@@ -362,7 +389,7 @@ Override per-project in `.claude/project-config.json` (shallow-merge — overrid
 6. **Not wired to any merge gate, CI, pre-commit, or pre-push hook.** v1 is manual/periodic measurement (#824's explicit out-of-scope: auto-tuning agents from results, a CI-gating eval run).
 7. **Corpus curation is manual, human-adjudicated work.** `/eval-agents` validates schema (Step 2), never truth. Do not add a corpus entry without real evidence (`independent_review`, `confirmed_fix`, or `human` in the `oracle` field) — a fabricated defect produces a confidently wrong score.
 8. **No ticket creation without explicit operator yes** (Step 9).
-9. **`tariq` requires an explicit `--corpus`** — no starter corpus is seeded for it in v1.
+9. **`tariq` uses its seeded starter corpus by default.** Supply `--corpus` to use a custom corpus.
 10. **`naqid` is not a supported `<agent>` value in v1** — see "Usage" above.
 11. **Every score is the output of non-deterministic LLM steps, not a fixed measurement.** Both the candidate spawn (Step 3d) and the defect-overlap match against the frozen key (Step 3g) are judgment calls made by an LLM — the frozen `ground_truth_defects` are fixed, but *matching a fresh run's findings against them* is not a byte-for-byte comparison, and re-running the exact same corpus against the exact same agent can produce a different verdict_justified call on a borderline entry. A score delta between two runs (this week's approve-precision vs. last month's) is **not automatically a real regression** — it can just as easily be run-to-run noise in the matching step. Treat a delta as a prompt to look at *which specific entries* flipped and re-read the agent's actual output for that entry, never as a number to trend-line on its own. This is the same caveat AgDR-0089 and spike #825 already carry for the starter corpus's small N — non-determinism compounds it, it doesn't replace it.
 
@@ -375,10 +402,15 @@ Override per-project in `.claude/project-config.json` (shallow-merge — overrid
 | `.claude/skills/eval-agents/lib/snapshot-diff.sh` | Filesystem snapshot/check pair — the Step 3c/3e contamination backstop (#833) |
 | `.claude/skills/eval-agents/tests/smoke.sh` | Validator smoke tests |
 | `.claude/skills/eval-agents/tests/test-snapshot-diff.sh` | Snapshot-diff smoke tests (#833) |
+| `.claude/skills/eval-agents/lib/source-snapshot.sh` | Builds the read-only, sanitized source snapshot for the source-access option (#1815) |
+| `.claude/skills/eval-agents/tests/test_source_snapshot.sh` | Source-snapshot tests: redaction, fail-closed leak check, read-only tree (#1815) |
+| `.claude/skills/eval-agents/lib/mine_disagreements.py` | Read-only candidate miner (#1440): Rex APPROVED vs. Hakim or Tariq CHANGES on one commit |
+| `.claude/skills/eval-agents/tests/test_mine_disagreements.sh` | Miner tests: Python unit tests, a fake `gh` read-only check, and a draft-rejection check (#1440) |
 | `docs/eval-agents/README.md` | Corpus directory overview, what's seeded, how to grow it |
 | `docs/eval-agents/SCHEMA.md` | Field-by-field corpus format |
-| `docs/eval-agents/corpus/rex.json` | Starter corpus — 6 entries |
-| `docs/eval-agents/corpus/hakim.json` | Starter corpus — 4 entries |
+| `docs/eval-agents/corpus/rex.json` | Starter corpus — 10 entries |
+| `docs/eval-agents/corpus/hakim.json` | Starter corpus — 11 entries |
+| `docs/eval-agents/corpus/tariq.json` | Starter corpus — 8 entries |
 | `docs/eval-agents/reports/` | Dated run reports land here |
 | `.claude/project-config.defaults.json` → `eval_agents.*` | Corpus/report dirs + thresholds |
 

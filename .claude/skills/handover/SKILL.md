@@ -2,7 +2,7 @@
 name: handover
 description: Onboard an external repo via a structured handover assessment + harnessability scoring across 5 codebase dimensions.
 argument-hint: "<project name> [path or url] [--topology <name>] [--all | --interactive]"
-allowed-tools: Bash, Read, Grep, Glob, Write
+allowed-tools: Bash, Read, Grep, Glob, Write, AskUserQuestion
 ---
 
 # /handover — External Repo Handover Assessment
@@ -101,12 +101,20 @@ The architecture stub is **written once** and never overwritten — it's a start
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 0. Mark this session as bootstrap (REQUIRED)
 
 `/handover` may run before any tracker tickets exist for the project being adopted, so the `require-active-ticket.sh` PreToolUse hook would block the registry / `projects/<name>/` writes the skill needs. Write a marker so the hook exempts this skill (it's on the default `bootstrap_skills` list in `.claude/project-config.defaults.json`):
 
 ```bash
-mkdir -p .claude/session && echo "handover" > .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+mkdir -p "$marker_home/.claude/session" && echo "handover" > "$skill_marker"
 ```
 
 Clear the marker on completion (Step "Post-Handover Checklist" below). If the skill is interrupted, the SessionStart hook `clear-bootstrap-marker.sh` clears it at the start of the next session. See AgDR-0011 + me2resh/apexyard#150.
@@ -117,7 +125,7 @@ The bootstrap exemption covers ONLY these writes:
 
 - `apexyard.projects.yaml` — registry append (step 7)
 - `projects/<name>/` — assessment, architecture stubs (container / context / sequence), README (steps 5, 6, 6.1)
-- `.claude/session/active-bootstrap` — the marker itself (step 0)
+- the path from `active_bootstrap_marker_path` — the marker itself (step 0)
 - Topology instantiation files (step 5.5, if a topology is picked)
 
 It does NOT cover:
@@ -175,43 +183,12 @@ All subsequent reads in steps 2–6 use `$WORKSPACE_DIR/<name>/` as the repo roo
 >
 > The gap this leaves — a managed-project clone's *own* `.githooks/` still isn't wired up by anything, so its terminal `git push` stays unprotected — is real and deliberately deferred, not silently dropped. The correct shape is for the framework to install **its own** hook into the clone's untracked `.git/hooks/` (never point at a tracked third-party directory), which needs its own design and its own ticket. Do not attempt it here.
 
-### 1.5-reindex. Reindex the cloned repo in MCP (when the MCP is installed)
-
-After a successful clone (`$CLONE_STATUS=cloned`), trigger an MCP reindex so `search_code` and `search_docs` return results during the deep-dive phases that follow (steps 2–6). Without this step those queries return empty against the just-cloned repo, and the agent silently falls back to `find` + `cat` + `Bash` — defeating the token-cost benefit of cloning early.
-
-The `apexyard-search` MCP server is an optional add-on. Check your tool list for `mcp__apexyard-search__reindex` before the call.
-
-- **Tool absent:** do not call it. Set `REINDEX_STATUS="unavailable"`. Print the line below once, then continue. This is not a failure.
-
-  ```
-  ℹ apexyard-search is not installed — using grep + Read for steps 2–6
-  ```
-
-- **Tool present:** call it.
-
-```
-mcp__apexyard-search__reindex(scope="project", project="<name>")
-```
-
-**On a failed call:** when the tool is present but the call errors, catch the error, print a single-line warning, set the marker, and continue. **Do not skip silently** — silent skips are indistinguishable between "server down" and "agent forgot the step", and the second failure mode is what this step exists to prevent.
-
-```
-⚠ MCP reindex unavailable — falling back to grep + Read for steps 2–6
-```
-
-```bash
-REINDEX_STATUS="indexed"   # or "unavailable" | "skipped" (when $CLONE_STATUS != cloned)
-```
-
-When `$REINDEX_STATUS="indexed"`, prefer `search_code` and `search_docs` over `grep` + `Read` for the assessment reads in steps 2–6 (per the MCP-search-first rule). When `unavailable` or `skipped`, fall back to `grep` + `Read` without further apology. Do every read in steps 2–6 with `grep` + `Read`. Do not skip or shorten a step. Do not report a semantic search or an index that did not run.
-
-A `PostToolUse` hook (`suggest-mcp-reindex-after-clone.sh`) fires after the clone command and emits a one-line reminder of this step. Same advisory shape as `detect-role-trigger.sh` — exit 0, non-blocking, removes the "I forgot the rule applied here" failure mode.
-
 ### 1.5. Pick a topology (default: skip / custom)
 
 ApexYard ships **harness-template topologies** — bundles of curated handbooks + CI pipelines + AgDR templates per service shape. Picking one here pre-bakes the right governance surface for the stack; declining keeps the existing flow byte-for-byte. See [`topologies/README.md`](../../../topologies/README.md) and AgDR-0048.
 
-If the operator passed `--topology <name>` on the CLI, skip the interactive prompt and use that pick. Otherwise prompt:
+If the operator passed `--topology <name>` on the CLI, skip the interactive prompt and use that pick. Otherwise use `AskUserQuestion`.
+Recommend `Skip / custom` first. Give each topology a one-line effect. Use the prompt below only without the tool:
 
 ```
 Which topology fits this project?
@@ -243,7 +220,8 @@ If `$PICKED_TOPOLOGY=""`, print nothing — the rest of the flow is unchanged.
 
 Background. As of 2026-07-09 the framework's mechanical gates reach beyond Claude Code through thin per-harness adapters — see `docs/harnesses/README.md`, the single source of truth for the support matrix. A team adopting an existing repo may already be running (or want to run) a non-Claude-Code harness against it; this step surfaces the adapter path at handover time instead of leaving the adopter to discover `docs/harnesses/` on their own. Light and skippable — Claude Code adopters (the default) answer one question and move on.
 
-Ask:
+Use `AskUserQuestion` to select harnesses. Preserve multiple selections and split the six options across wizard questions.
+Recommend Claude Code first. Use the prompt below only without the tool:
 
 ```
 Which harness(es) will drive work on {name}?
@@ -637,10 +615,13 @@ If no risks match a row, omit that row. If fewer than 3 actions come out, add:
 ## Cleanup (REQUIRED before exit)
 
 ```bash
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-Always remove the bootstrap marker on a clean exit. If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the stale marker on the next session.
+Always remove the bootstrap marker on a clean exit. If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the marker when the same session restarts.
 
 ## Post-Handover Checklist
 
@@ -768,7 +749,9 @@ By this point the **computed core** is done: the handover assessment (step 5) an
 
 **Skip condition (`--all`)**: if the operator passed `--all` on the invocation, skip the checklist entirely. Generate the full default set (every row marked "default ✓" in the catalogue below) using each doc's conventional template. Note `document selection: --all (full set)` in the step 10 summary and continue to step 6. This is the byte-for-byte pre-checklist behaviour — existing scripted invocations keep working by adding `--all`.
 
-Otherwise (default, or explicit `--interactive`): present the checklist.
+Otherwise (default, or explicit `--interactive`): use `AskUserQuestion` for the document checklist.
+Split the nine documents into three wizard questions. Preserve the pre-ticked default and multiple selections.
+Use the checklist below only without the tool.
 
 #### Two kinds of output
 
@@ -852,7 +835,8 @@ registry=$(portfolio_registry)
 custom_dir="$(dirname "$registry")/custom-templates"
 ```
 
-Present the candidates, defaulting to the conventional one:
+Use `AskUserQuestion` for each template pick. Recommend the conventional template first.
+Present the candidates below only when the harness lacks the tool:
 
 ```
 Template for the L2 container diagram:
@@ -1324,10 +1308,10 @@ The repo was cloned in step 1.5-clone (or was already local). Offer follow-up de
 
 **If `$CLONE_STATUS` is `cloned` or `preserved`:**
 
-Print a single follow-up offer after the step 10 summary. Include "and indexed in MCP" only when `$REINDEX_STATUS` is `indexed`.
+Print a single follow-up offer after the step 10 summary.
 
 ```
-✓ <name> is cloned at $WORKSPACE_DIR/<name>/[ and indexed in MCP].
+✓ <name> is cloned at $WORKSPACE_DIR/<name>/.
   Want to run any of the following against the clone now?
 
   1. /threat-model <name>   — STRIDE threat model (recommended for first handover)
@@ -1537,7 +1521,8 @@ Every repo apexyard governs is a potential backlink + a visible signal that the 
 
 #### Pick the variant (governed_by vs built_with)
 
-On a yes, offer the second badge variant for repos that were built with apexyard from the start rather than adopted into its governance after the fact:
+On a yes, use `AskUserQuestion` to select the badge variant. Recommend `Governed by ApexYard` first.
+Use the prompt below only when the harness lacks the tool:
 
 ```
 Which wording fits <name>?

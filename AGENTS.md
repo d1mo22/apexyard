@@ -84,14 +84,18 @@ Pi does not auto-import rule files. `Read` a named file under `.claude/rules/` w
 
 ### Skills, without the slash-command runner
 
-`.claude/skills/<name>/SKILL.md` are markdown prompts — 64 of them, covering everything from filing a ticket (`/feature`, `/bug`, `/task`) to running an audit (`/launch-check`, `/threat-model`) to cutting a release. Claude Code turns these into typed slash commands; pi has no slash-command mechanism, so invoke one by `Read`-ing its `SKILL.md` and following the process it describes step by step (e.g. read `.claude/skills/feature/SKILL.md`, then do what it says). The skill's content is the same either way — only the invocation mechanism differs.
+`.claude/skills/<name>/SKILL.md` contains 68 skill prompts.
+Use `/scaffold` for an owner interview, a validated spec, and project floor generation.
+Other skills file tickets, run audits, and cut releases.
+Claude Code exposes these skills as slash commands.
+In pi, read the required `SKILL.md` and follow its steps.
+Both tools use the same skill content.
 
 ### What's NOT bridged yet
 
 Being upfront about the gap: this section gives you the rules as *instructions* by default. As of me2resh/apexyard#815, mechanical enforcement is available too — but only if you install it (it isn't auto-loaded the way `AGENTS.md` itself is):
 
 - **Mechanical gate enforcement** — the two-marker merge gate, ticket-first edit blocking, secrets scanning, AgDR-required checks, red-CI merge blocking. `harness-adapters/pi/` shells out to the SAME Claude-Code-specific bash hooks via a pi `tool_call` extension — install it (see `harness-adapters/pi/README.md`) to get real blocking under pi. Until installed, none of it fires. See me2resh/apexyard#804 (the spike that proved this viable) and #815 (the shipped adapter).
-- **MCP-backed code/docs search** (`apexyard-search`) — pi's design omits MCP entirely; fall back to plain `grep`/`Read`.
 - **Role-trigger advisory banners** — Claude Code gets a `PreToolUse` banner nudging "this diff touches `**/auth/**`, consider the Security Auditor"; pi gets no such nudge. Self-check the role-triggers table manually.
 
 See `docs/harnesses/pi.md` for the full today-vs-not-yet breakdown and the install shape.
@@ -115,11 +119,11 @@ The rest of this file is for an agent extending **apexyard itself** — its hook
 ### Project structure
 
 - `.claude/` — framework hooks, agents, rules, skills, settings.json
-  - `.claude/hooks/` — 60 shell scripts (PreToolUse / PostToolUse / SessionStart)
-  - `.claude/skills/` — 66 slash commands (one dir per skill, each with `SKILL.md`)
+  - `.claude/hooks/` — 54 shell scripts (PreToolUse / PostToolUse / SessionStart)
+  - `.claude/skills/` — 68 slash commands (one dir per skill, each with `SKILL.md`)
   - `.claude/agents/` — 23 sub-agents: 3 utility (Rex code-reviewer, Hakim security-reviewer/auditor, Munir dep-auditor) + 20 dept-aligned agents across engineering / product / design / security / data (the pr-manager + ticket-manager lifecycle agents were retired — AgDR-0105; their lifecycles are owned by the merge gates / `/approve-merge` and the structured ticket skills)
-  - `.claude/rules/` — 22 modular rule files. CLAUDE.md indexes them by name. Load a file when the work needs it. Claude Code excludes this tree from auto-load via `claudeMdExcludes` (AgDR-0160 / #1354).
-  - `.claude/settings.json` — hook wiring + `claudeMdExcludes`
+  - `.claude/rules/` — 22 modular rule files. CLAUDE.md indexes them by name. Load a file when the work needs it. Claude Code excludes this tree from auto-load via per-clone `claudeMdExcludes` in `.claude/settings.local.json` (AgDR-0233).
+  - `.claude/settings.json` — hook wiring. `/setup` and SessionStart write per-clone `claudeMdExcludes` into gitignored `.claude/settings.local.json`.
 - `roles/` — 20 role definitions across Engineering, Product, Design, Security, Data, Architecture
 - `workflows/` — SDLC, code-review, deployment workflow docs
 - `templates/` — PRD, ADR, AgDR (Agent Decision Record), migration AgDR, C4 L1/L2, vision, sequence, DFD, audit templates, ticket templates
@@ -157,7 +161,7 @@ The rest of this file is for an agent extending **apexyard itself** — its hook
 ### Rate limits / constraints
 
 - **Two-marker merge gate** — every merge requires Rex (code-reviewer agent) AND explicit per-PR CEO approval. Plan-level "go" does NOT authorize a merge. Mechanically enforced by `block-unreviewed-merge.sh`.
-- **Ticket-first hook** — code edits are blocked without an active ticket marker at `.claude/session/current-ticket`. Bootstrap-class skills (`/setup`, `/handover`, `/update`, `/split-portfolio`) are exempt.
+- **Ticket-first hook** — code edits are blocked unless the working tree holds a ticket marker (`apexyard-ticket` in the tree's git dir, written by `/start-ticket`). Bootstrap-class skills (`/setup`, `/handover`, `/update`, `/split-portfolio`) are exempt.
 - **AgDR required for architectural decisions** — `require-agdr-for-arch-changes.sh` and `require-agdr-for-arch-pr.sh` block PRs that touch architecture without a matching `docs/agdr/AgDR-NNNN-*.md` reference.
 - **No direct pushes to `main`** — every change goes through a PR. Enforced by `block-main-push.sh`.
 - **No `git add -A`** — staging must be explicit. Enforced by `block-git-add-all.sh`.
@@ -183,7 +187,7 @@ If you're an AI agent landing in this repo for the first time:
 
 1. If you're operating an ops fork on an adopter's behalf (not Claude Code), read "Operator governance bridge" above first. Otherwise, read `CLAUDE.md` (framework spec — even if you're not Claude Code, the rules transfer)
 2. Skim `docs/multi-project.md` (full setup guide, directory layout, daily workflow)
-3. Browse `.claude/skills/` for the 66 slash commands (each `SKILL.md` is one capability)
+3. Browse `.claude/skills/` for the 68 slash commands (each `SKILL.md` is one capability)
 4. Browse `roles/` to understand the role-activation model
 5. Browse `templates/` for the standard document shapes
 6. Check `.claude/rules/` for the mechanical rules (ticket vocabulary, PR workflow, plan mode, parallel work, leak protection, etc.)

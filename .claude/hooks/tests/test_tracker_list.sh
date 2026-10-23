@@ -27,6 +27,11 @@
 # Exit 0 = all pass. Exit 1 on first failure.
 
 set -u
+
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 
 HOOK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,6 +55,7 @@ make_sandbox() {
   local sb registry_body="${1:-}"
   sb=$(mktemp -d); sb=$(cd "$sb" && pwd -P)
   mkdir -p "$sb/.claude/hooks" "$sb/bin"
+  git -C "$sb" init -q || return 1
   touch "$sb/onboarding.yaml"
   cp "$TRACKER_LIB"   "$sb/.claude/hooks/_lib-tracker.sh"
   cp "$CONFIG_LIB"    "$sb/.claude/hooks/_lib-read-config.sh"

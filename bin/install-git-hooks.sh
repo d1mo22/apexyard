@@ -209,6 +209,21 @@ if [ -z "$TARGET_ROOT" ]; then
   exit 2
 fi
 
+# git rev-parse can print a drive-letter path.
+# Git Bash mounts Temp at /tmp. pwd -P prints that mount path.
+# cygpath -u applies the same mount table. The string transform does not.
+# Store one form before the directory test and the containment check.
+# An empty result does not replace the git path.
+# A failed cygpath call leaves the /c/Users/.../Temp form.
+# That form does not match a /tmp resolve, so the check below exits 2.
+if command -v _windows_path_to_posix >/dev/null 2>&1; then
+  _target_posix=$(_windows_path_to_posix "$TARGET_ROOT")
+  if [ -n "$_target_posix" ]; then
+    TARGET_ROOT="$_target_posix"
+  fi
+fi
+unset _target_posix
+
 # ---------------------------------------------------------------------------
 # MEDIUM-3 (PR #1087 review): when --repo-dir is given but is not itself a
 # repo's own root, `git rev-parse --show-toplevel` walks UP and silently
@@ -281,13 +296,27 @@ fi
 # missing" case for the pinned regression test.
 # ---------------------------------------------------------------------------
 HOOKS_DIR_RESOLVED=$(_resolve_real_path "$TARGET_ROOT/$HOOKS_DIR_NAME")
-case "$HOOKS_DIR_RESOLVED" in
-  "$TARGET_ROOT"/*|"$TARGET_ROOT") : ;;
-  *)
-    echo "ERROR: --hooks-dir '$HOOKS_DIR_NAME' resolves to '$HOOKS_DIR_RESOLVED', which is outside $TARGET_ROOT. Refusing to point core.hooksPath outside the repo tree." >&2
-    exit 2
-    ;;
-esac
+# Compare the repository root with the resolved hooks directory.
+# Both sides use _windows_path_to_posix inside path_is_under_root.
+# cygpath -u supplies the Git Bash mount form when it is present.
+# An empty resolve still fails this check.
+# That failure keeps a missing path lib from reaching ghp_classify
+# (the load-bearing ordering above).
+_hooks_contained=1
+if command -v path_is_under_root >/dev/null 2>&1; then
+  if ! path_is_under_root "$TARGET_ROOT" "$HOOKS_DIR_RESOLVED"; then
+    _hooks_contained=0
+  fi
+else
+  case "$HOOKS_DIR_RESOLVED" in
+    "$TARGET_ROOT"/*|"$TARGET_ROOT") ;;
+    *) _hooks_contained=0 ;;
+  esac
+fi
+if [ "$_hooks_contained" != 1 ]; then
+  echo "ERROR: --hooks-dir '$HOOKS_DIR_NAME' resolves to '$HOOKS_DIR_RESOLVED', which is outside $TARGET_ROOT. Refusing to point core.hooksPath outside the repo tree." >&2
+  exit 2
+fi
 
 # #1089: reaching this line at all already proves _resolve_real_path
 # resolved a real path above — see the LOAD-BEARING ORDERING comment on

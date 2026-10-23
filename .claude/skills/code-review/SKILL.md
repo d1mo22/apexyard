@@ -36,7 +36,7 @@ See [`.claude/rules/role-triggers.md`](../../rules/role-triggers.md) for the ful
 
 ## Running tests in a scratch clone
 
-Rex may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export the PR head with `git archive | tar -x` into a literal non-git directory. The export step still needs an active session ticket. A later write to a literal path inside that directory can use the me2resh/apexyard#883 exemption. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/code-reviewer.md` § "Running tests in a scratch clone".
+For tests and probes, use the scratch-clone pattern in `.claude/agents/code-reviewer.md` § "Running tests in a scratch clone". If a hook blocks a command, stop and report the command, hook, and message. Never disguise a command to bypass a hook.
 
 The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` while the active-reviewer marker exists. Prepare the scratch clone and fetch the PR head before step 0 arms the marker.
 
@@ -53,20 +53,29 @@ Retain its required sections and give each checklist result a reason or evidence
 Before submission, check the report against that format and repair omissions.
 Do not write a process transcript.
 
+### CI order and depth
+
+Wait for green CI with a Monitor before spawning Rex. Rex checks CI once and never waits.
+Before each spawn or resume, follow `docs/skills/code-review-depth.md`. Run the tier script from the trusted base at the reviewed SHA. Check the full range. Take the stricter result with Rex. Missing evidence means Full. Apply the 300-token hand-back cap and TTL-specific resume window. A fresh Rex reads earlier findings from the posted review ID and commit range. Never use an orchestrator summary as evidence.
+
+### After a base-branch refresh: run the carry-over check first (me2resh/apexyard#1638)
+
+Do not spawn Rex after a base-branch refresh before you run the carry-over check.
+The check is `rex_approval_carries_over` in `.claude/hooks/_lib-merge-behind.sh`.
+`.claude/rules/pr-workflow.md` § "Carry-over check after a refresh" gives the command and what the check accepts.
+
+- `true`: do not spawn Rex. The merge gate accepts the existing Rex marker at the new HEAD.
+- `false` or `unknown`: spawn Rex for a delta re-review of the new merge commit.
+
 ### 0. Write the active-reviewer marker (REQUIRED — me2resh/apexyard#843)
 
 Before spawning the Code Reviewer agent (Rex), write the active-reviewer session marker. It records that this review pass is the sanctioned one, and suppresses `warn-review-marker-write.sh`'s advisory warning on Rex's `*-rex.approved` write (that hook warns and never blocks since #1026 — AgDR-0111). The marker is scoped to THIS Claude Code session (me2resh/apexyard#1376) — resolve its path through `active_reviewer_marker_path`, never write the bare `.claude/session/active-reviewer` path directly, or a concurrent session's review would read or clobber it. At skill entry:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "rex")
 mkdir -p "$(dirname "$active_marker")"
 printf '%s\n' "<owner/repo>#<pr>:rex" > "$active_marker"
 ```
@@ -74,17 +83,14 @@ printf '%s\n' "<owner/repo>#<pr>:rex" > "$active_marker"
 On skill exit (after Rex posts its verdict, whether APPROVED or CHANGES REQUESTED), clear the marker. Shell variables do not persist across separate Bash tool calls, so the exit step re-resolves `ops_root` and `active_marker` from scratch — it does not reuse the step-0 variable, which would silently be empty in a later call and turn the `rm -f` into a no-op:
 
 ```bash
-ops_root=$(git rev-parse --show-toplevel)
-r="$ops_root"
-while [ -n "$r" ] && [ "$r" != "/" ]; do
-  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
-  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
-  r=$(dirname "$r")
-done
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
 . "$ops_root/.claude/hooks/_lib-review-markers.sh"
-active_marker=$(active_reviewer_marker_path "$ops_root")
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "rex")
 rm -f "$active_marker"
 ```
+
+The marker is keyed on session, repo, PR and review kind (me2resh/apexyard#1649). Each review writes and clears only its own file, so reviews run at the same time. The mutation lock applies to review agents only; the orchestrator and build agents can keep working. Use the same `<owner/repo>`, `<pr>` and kind in the write step and the exit step. Spawn the reviewer with the Agent tool and `subagent_type: code-reviewer`. Never use `general-purpose`: the lock finds a review agent by that type.
 
 Nothing mechanically stops a build-class sub-agent writing the same file; what makes Rex's marker legitimate is that a real, independent review happened. See `.claude/hooks/warn-review-marker-write.sh` and `.claude/rules/pr-workflow.md` § "Build agents cannot self-review".
 
@@ -119,6 +125,74 @@ refusal message — but the cheap fix is upstream of both: don't pass a path.
 5. Check for AgDR links if technical decisions were made
 6. On JS/TS diffs, run the Fallow static-analysis pass (§ 9 of the agent) — changed-scope, fail-soft, advisory; render a `### Fallow Findings` table + dry-run fix preview
 7. Submit the review through the tracker-agnostic `tracker_review_submit` (gh PR / glab MR / custom host — #758), not a hardcoded `gh pr review`, then clear the active-reviewer marker from step 0
+
+**Body path (AgDR-0266).** Rex writes the body with Write to `<ops-root>/.claude/session/reviews/bodies/<owner>__<repo>__<pr>-rex.md` (`review_body_path`), then posts it with `tracker_review_submit <owner/repo> <pr> comment <body_file>`. Not a heredoc.
+
+On GitHub, add `ready-to-merge` after APPROVED: `gh pr edit {number} --repo "$PR_HOST_REPO" --add-label ready-to-merge`.
+Remove it after CHANGES REQUESTED: `gh pr edit {number} --repo "$PR_HOST_REPO" --remove-label ready-to-merge`.
+A label failure changes no verdict or marker.
+
+### 8. Offer pre-merge QA after APPROVED
+
+Run this step only after Rex posts an APPROVED verdict and the active-reviewer marker is clear.
+Do not offer QA after CHANGES REQUESTED or COMMENT.
+
+Resolve the ops root again. Shell variables from step 0 do not persist across Bash calls.
+Read the setting through the shared config reader:
+
+```bash
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
+source "$ops_root/.claude/hooks/_lib-read-config.sh"
+qa_offer=$(config_get_or '.qa.pre_merge_offer' 'ask')
+case "$qa_offer" in
+  ask|always|never) ;;
+  *) qa_offer=ask ;;
+esac
+```
+
+- `ask`: Ask: "Rex approved PR #<pr>. Run QA (Salim) against the acceptance criteria before merge? (yes / no)" Replace `<pr>` with the actual PR number.
+  On `yes`, run Salim now. On `no`, leave QA for the existing post-merge `qa` label trigger.
+  If there is no answer, finish the review with the offer pending. Do not infer consent from silence.
+- `always`: Run Salim now without asking.
+- `never`: Skip this offer. Keep the existing post-merge QA flow.
+
+For `yes` or `always`, fetch the PR HEAD SHA from the forge.
+Run Salim against the PR branch at the recorded HEAD SHA.
+Use a scratch checkout or a test deployment built from that SHA.
+Give Salim the linked ticket and comments.
+Salim must verify each acceptance criterion and return evidence for every result.
+If the ticket has no acceptance criteria, report INCOMPLETE.
+If the PR HEAD changes during QA, discard the result.
+Run Rex again before another QA attempt, unless the carry-over check returns `true` for the new HEAD.
+
+Post Salim's result on the PR with `tracker_review_submit <owner/repo> <pr> comment <body_file>`.
+Use the `comment` verdict, never `approve`.
+Include the full PR HEAD SHA, environment, criterion results, and evidence.
+Start the body with `## Pre-merge QA (Salim)` so the post-merge role can identify it.
+For a complete PASS, include this line in the posted body. Replace the SHA placeholder with the full PR HEAD SHA tested:
+
+```text
+<!-- apexyard-pre-merge-qa: sha=<full-commit-sha> status=PASS -->
+```
+
+Reuse a complete pre-merge QA PASS only when its stamped SHA matches the merged PR's final head SHA.
+This is the PR head commit when it merged (the MR head SHA on GitLab).
+A PASS stamped with an earlier head does not count.
+Accept reports only from the repository owner, a member or a collaborator, or the account that posted the Rex review.
+On GitHub, verify `author_association` of `OWNER`, `MEMBER` or `COLLABORATOR`, or the Rex account match.
+Otherwise, run post-merge QA as usual.
+
+Use `status=FAIL` or `status=INCOMPLETE` for failed or unverified criteria.
+Never mark such a report PASS.
+If posting fails, report the failure and do not claim a reusable QA result.
+Stop before requesting human merge approval when any criterion fails or cannot be verified.
+Give the author the findings and let them revise the PR.
+A new commit needs a new Rex verdict and QA run.
+
+This offer is advisory. Never write or relax a merge marker, and never merge from this step.
+Only the human-invoked `/approve-merge` records merge approval and merges.
+A QA PASS does not grant approval. A QA failure stops this review flow but creates no mechanical merge gate.
 
 ## Review Checklist
 

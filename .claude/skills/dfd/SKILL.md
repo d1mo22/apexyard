@@ -2,7 +2,7 @@
 name: dfd
 description: DFD with trust boundaries + data classifications (Mermaid + optional Threat Dragon JSON). Source-of-truth for /threat-model.
 argument-hint: "[project-name | . | --scope-all] [--format=mermaid|dragon|all]"
-allowed-tools: Bash, Read, Grep, Glob, Write
+allowed-tools: Bash, Read, Grep, Glob, Write, AskUserQuestion
 ---
 
 # /dfd — Data Flow Diagram Extractor
@@ -65,6 +65,11 @@ docs/architecture/system-dfd-source.yaml               ← per-service discovery
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill.
+Follow `.claude/rules/reporting-style.md § Operator choices`.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 1. Resolve the target + scope
 
 - If the argument is `.` → use cwd as the target.
@@ -91,6 +96,10 @@ The grep-fallback signatures live in `.claude/skills/dfd/discover.sh` (axes 1–
 For `--scope-all`: run axes 1–6 against each registered project, then in step 3 compose by treating every cross-service flow (detected via `_lib-multi-repo-trace.sh`) as a trust-boundary crossing.
 
 ### 3. Present the candidate model for operator review
+
+Use `AskUserQuestion` for describe, edit, accept, or quit after showing the model.
+Recommend accept first when the model has no known gaps. Otherwise recommend edit first.
+Use the menu below only without the tool.
 
 Render the discovery output in a compact table grouped by axis:
 
@@ -150,13 +159,7 @@ Don't ask questions whose answer is already in the discovery report.
 
 ### 5. Generate the output(s)
 
-Resolve the template:
-
-```bash
-template=$(portfolio_resolve_template architecture/dfd.md)
-```
-
-Single-fork adopters with no override fall through to `templates/architecture/dfd.md`. Adopters who want a customised shape drop their version at `<private_repo>/custom-templates/architecture/dfd.md` (same convention as `/c4`).
+`generate-mermaid.sh` writes the whole `dfd.md` itself. It does not read `templates/architecture/dfd.md`. An override at `<private_repo>/custom-templates/architecture/dfd.md` has no effect on generated output. The template is the starting point for a DFD written by hand. A DFD from either source must follow the heading-contract rule under Rules below.
 
 #### 5a. Mermaid markdown (always)
 
@@ -185,7 +188,7 @@ bash .claude/skills/dfd/generate-mermaid.sh "$PROJECT" "$discovery_yaml" "$class
 cat "$discovery_yaml" "$classifications_yaml" > "${projects_dir}/${PROJECT}/architecture/dfd-source.yaml"
 ```
 
-The generator replaces placeholders in the template skeleton with real actors / processes / stores / flows from the in-memory model. Every cross-boundary arrow MUST carry a payload label.
+The generator writes a fixed skeleton with placeholder nodes and rows. It appends both YAML reports under `## Discovery provenance`. Every cross-boundary arrow MUST carry a payload label.
 
 #### 5b. Threat Dragon v2 JSON (on `--format=dragon` or `--format=all`)
 

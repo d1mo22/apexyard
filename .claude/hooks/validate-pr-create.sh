@@ -1,7 +1,7 @@
 #!/bin/bash
 # Validates PR creation:
 # - PR title matches format: type(TICKET): description
-# - PR body contains a Glossary section
+# - PR body contains Summary, Testing, Glossary, and a ticket reference
 # - Branch has a ticket ID
 # - The ticket referenced in the title actually exists in the tracker repo
 #   (backstop for the ticket-vocabulary rule — catches fabricated #N that
@@ -16,17 +16,27 @@ if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Normalize backslash line-continuation sequences so multi-line gh commands
-# parse as a single logical line for all subsequent flag extraction.
-# Replaces every '\<newline>' pair with a single space.
-# Fixes apexyard#743 Bug 2: without normalization, a --repo value split onto
-# its own continuation line could be mis-extracted (the trailing '\' captured
-# instead of the repo slug, yielding garbled TRACKER_REPO like "(hook)").
-# NOTE: must be bash-3.2-safe (macOS default). The combined ANSI-C pattern
-# ${COMMAND//$'\\\n'/ } is a silent NO-OP under bash 3.2 — the newline in the
-# pattern doesn't match. Holding the newline in a var and escaping the
-# backslash separately works on both 3.2 and 5.x (verified via `od -c`).
-nl=$'\n'; COMMAND="${COMMAND//\\$nl/ }"
+# Keep the older broad scan: gh pr\<newline>create must remain visible,
+# including pairs inside quoted data. Removal would hide the create verb.
+. "$(dirname "${BASH_SOURCE[0]}")/_lib-awk-fallback.sh"
+for fn in _run_awk_or_fallback join_shell_continuations _join_shell_continuations_fallback; do
+  if ! declare -F "$fn" >/dev/null 2>&1; then
+    printf 'BLOCKED: missing required awk helper %s. Restore _lib-awk-fallback.sh and retry.\n' "$fn" >&2
+    exit 2
+  fi
+done
+_vpc_join_fallback() {
+  _join_shell_continuations_fallback "$1" broad-space
+  return 1
+}
+_vpc_join_failed=0
+if _vpc_joined=$(join_shell_continuations "$COMMAND" broad-space _vpc_join_fallback); then
+  COMMAND=$_vpc_joined
+else
+  _vpc_join_failed=1
+  COMMAND=$_vpc_joined
+fi
+unset _vpc_joined
 
 # Parse --repo / -R from the gh command for cross-repo PR creation.
 # Handles: --repo VALUE, --repo=VALUE, -R VALUE, -R=VALUE.
@@ -173,11 +183,13 @@ while [ "$_gate_iter" -lt 10 ]; do
   # structural change from round 1 (which ran all four shapes every
   # iteration, unconditionally) to round 2 (check-then-strip).
 
-  # 1. cd <path> && / ; / | -- quoted or bare path.
+  # 1. cd <path> && / || / ; / | -- quoted or bare path.
+  #    Match `||` before `|` so a double-pipe chain is not left with a
+  #    leading `|` that hides a later `gh pr create` (#1451 B1-c).
   _stripped=$(printf '%s' "$_cmd_head" | sed -E \
-    "s/^[[:space:]]*cd[[:space:]]+\"[^\"]+\"[[:space:]]*(&&|;|\|)[[:space:]]*//;
-     s/^[[:space:]]*cd[[:space:]]+'[^']+'[[:space:]]*(&&|;|\|)[[:space:]]*//;
-     s/^[[:space:]]*cd[[:space:]]+[^&;|[:space:]]+[[:space:]]*(&&|;|\|)[[:space:]]*//")
+    "s/^[[:space:]]*cd[[:space:]]+\"[^\"]+\"[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//;
+     s/^[[:space:]]*cd[[:space:]]+'[^']+'[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//;
+     s/^[[:space:]]*cd[[:space:]]+[^&;|[:space:]]+[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//")
   if [ "$_stripped" != "$_cmd_head" ]; then
     _cmd_head="$_stripped"
   else
@@ -196,9 +208,9 @@ while [ "$_gate_iter" -lt 10 ]; do
         # 4. A quote-free arbitrary segment followed by a top-level
         #    separator — last resort, only tried once shapes 1-3 (and the
         #    verb-check above) have already failed to match this
-        #    iteration's head.
+        #    iteration's head. `||` before `|` (same as shape 1).
         _cmd_head=$(printf '%s' "$_cmd_head" | sed -E \
-          "s/^[[:space:]]*[^\"'&;|]+(&&|;|\|)[[:space:]]*//")
+          "s/^[[:space:]]*[^\"'&;|]+(&&|\|\||;|\|)[[:space:]]*//")
       fi
     fi
   fi
@@ -206,13 +218,19 @@ while [ "$_gate_iter" -lt 10 ]; do
   [ "$_cmd_head" = "$_cmd_head_prev" ] && break
   _gate_iter=$((_gate_iter + 1))
 done
-if [ "$_gate_fired" -ne 1 ]; then
+if [ "$_gate_fired" -ne 1 ] && [ "$_vpc_join_failed" -eq 0 ]; then
   unset _cmd_for_gate _cmd_head _cmd_head_prev _gate_iter _gate_fired _stripped
   exit 0
 fi
 unset _cmd_for_gate _cmd_head _cmd_head_prev _gate_iter _gate_fired _stripped
 
 ERRORS=""
+if [ "$_vpc_join_failed" -ne 0 ]; then
+  # The broad tr fallback can alter title or path text. Continue validation,
+  # but never accept a command after its exact normalization failed.
+  ERRORS="${ERRORS}Could not normalize command text safely. Retry PR creation.\n"
+fi
+unset _vpc_join_failed
 
 # Extract --title value (macOS-compatible, no grep -P).
 #
@@ -257,6 +275,11 @@ fi
 if [ -z "$CONFIG_ROOT" ]; then
   CONFIG_ROOT="$REPO_ROOT"
 fi
+ORBIT_TITLE=0
+if [ -f "$HOOK_DIR/_lib-orbit-records.sh" ]; then
+  # shellcheck source=./_lib-orbit-records.sh
+  . "$HOOK_DIR/_lib-orbit-records.sh"
+fi
 PR_TYPES=""
 if [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
   # shellcheck disable=SC1090,SC1091
@@ -267,11 +290,260 @@ if [ -z "$PR_TYPES" ]; then
   PR_TYPES="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|spike|sync"
 fi
 
+# External contributions (#1448): a PR aimed at a repository the adopter
+# contributes to but does NOT govern. Such a repository has its own
+# CONTRIBUTING.md and its own tracker, so imposing this framework's title
+# convention on it refuses a PR that is correct for its destination.
+#
+# Opt-in and repo-scoped: `.external_contributions[]` in project-config, the
+# same shape leak-protection uses for its public-framework-repo list.
+#
+# The registry WINS. If the target is a managed project, the exemption does
+# not apply however the list is written — otherwise adding a governed repo to
+# this list would quietly disable title validation for work the framework is
+# supposed to be governing, which is a gate relaxation dressed up as config.
+#
+# Helpers for this block only (#1451 B1-b / B1-c / B2-b / A-2).
+
+# Normalise a repo reference to lowercase owner/name. Strips scheme,
+# git@host:, bare host/, trailing .git, and trailing /. Echoes nothing when
+# the result is not exactly owner/name (caller decides whether to warn).
+_vpc_normalize_repo_slug() {
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  s=$(printf '%s' "$s" | sed -E 's|^[a-z][a-z0-9+.-]*://||')
+  s=$(printf '%s' "$s" | sed -E 's|^git@[^:]+:||')
+  s=$(printf '%s' "$s" | sed -E 's|^[a-z0-9.-]+\.[a-z]{2,}/||')
+  s=$(printf '%s' "$s" | sed -E 's|\.git$||')
+  s=$(printf '%s' "$s" | sed -E 's|/$||')
+  if printf '%s' "$s" | grep -qE '^[^/]+/[^/]+$'; then
+    printf '%s' "$s"
+  fi
+}
+
+# Echo the PR-create SEGMENT of a quote-blanked first line (#1451 B1-c).
+# Starts at the `gh pr create` invocation and ends at the next top-level
+# `&&`, `||`, `;`, `|`, or end of line. A trailing unquoted `#` comment
+# (a `#` that starts a shell word) is stripped so a comment mentioning
+# `--repo` cannot grant the exemption. Echoes nothing when no create verb
+# is present on the line.
+_vpc_pr_create_segment() {
+  # Portable word-boundary after "create": macOS awk (nawk) has no `\b`.
+  printf '%s' "$1" | awk '
+    {
+      line = $0
+      if (!match(line, /(^|[[:space:]])gh[[:space:]]+pr[[:space:]]+create([^a-zA-Z0-9_]|$)/)) next
+      start = RSTART
+      if (substr(line, start, 1) ~ /[[:space:]]/) start++
+      seg = substr(line, start)
+      out = ""
+      n = length(seg)
+      i = 1
+      while (i <= n) {
+        two = substr(seg, i, 2)
+        if (two == "&&" || two == "||") break
+        c = substr(seg, i, 1)
+        if (c == ";" || c == "|") break
+        out = out c
+        i++
+      }
+      if (match(out, /(^|[[:space:]])#/)) {
+        if (RSTART == 1) out = ""
+        else out = substr(out, 1, RSTART - 1)
+      }
+      print out
+    }
+  '
+}
+
+EXTERNAL_TARGET=""
+if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
+  # CMD_REPO is pr_cmd_target_repo's continuation-joined parse — the repo
+  # the CLI will actually use. Normalise it before any list/registry match
+  # (#1451 B2-b): URL and SSH forms must become owner/name or the registry-
+  # wins rail never fires.
+  _vpc_repo_lc=$(_vpc_normalize_repo_slug "$CMD_REPO")
+
+  # FAIL CLOSED on an ambiguous / body-injected target (#1451 B1 / B1-b / B1-c).
+  # Quote-blanking is line-oriented, so a multi-line --body heredoc left a
+  # `--repo` token on a later line visible to a whole-command scan, and
+  # CMD_REPO could be set from body text while the real create targeted the
+  # governed cwd. Take the exemption candidate ONLY from the PR-create
+  # SEGMENT of the command's first line (from `gh pr create` to the next
+  # unquoted `&&` / `||` / `;` / `|` / newline, with trailing `#` comments
+  # stripped), with quoted spans blanked there, and require that candidate
+  # to equal CMD_REPO after the same normalisation. A prior `gh pr view
+  # --repo … &&` or a trailing `# … --repo …` comment must not grant the
+  # exemption. Reuse pr_cmd_target_repo for the segment value so there is
+  # one parser. If the segment target cannot be resolved unambiguously,
+  # no exemption.
+  _vpc_ambiguous=""
+  if [ -z "$_vpc_repo_lc" ]; then
+    # CMD_REPO did not normalise to owner/name — cannot match the list safely.
+    _vpc_ambiguous="1"
+  else
+    _vpc_first_line=$(printf '%s\n' "$COMMAND" | head -n 1)
+    _vpc_first_unquoted=$(printf '%s' "$_vpc_first_line" \
+      | sed -E 's/"[^"]*"/""/g; s/'"'"'[^'"'"']*'"'"'/'"''"'/g')
+    _vpc_create_seg=$(_vpc_pr_create_segment "$_vpc_first_unquoted")
+    if [ -z "$_vpc_create_seg" ]; then
+      _vpc_ambiguous="1"
+    else
+      # Exactly one --repo/-R flag on the create segment, outside quotes.
+      _vpc_repo_tokens=$(printf '%s\n' "$_vpc_create_seg" \
+        | grep -oE '(^|[[:space:]])(--repo|-R)([[:space:]]+|=)' | wc -l | tr -d ' ')
+      if [ "${_vpc_repo_tokens:-0}" != "1" ]; then
+        _vpc_ambiguous="1"
+      else
+        _vpc_first_repo=""
+        if command -v pr_cmd_target_repo >/dev/null 2>&1; then
+          # Leading space satisfies pr_cmd_target_repo's flag-boundary sed.
+          _vpc_first_repo=$(pr_cmd_target_repo " ${_vpc_create_seg}")
+        else
+          _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+            | sed -nE 's/.*[[:space:]]--repo[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]--repo=([^[:space:]]+).*/\1/p' | head -1)
+          fi
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]-R[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+          fi
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]-R=([^[:space:]]+).*/\1/p' | head -1)
+          fi
+        fi
+        _vpc_first_repo_lc=$(_vpc_normalize_repo_slug "$_vpc_first_repo")
+        # Must equal the CLI target. A body-only --repo makes CMD_REPO non-empty
+        # while the create segment has none (or a different flag) — refuse.
+        if [ -z "$_vpc_first_repo_lc" ] || [ "$_vpc_first_repo_lc" != "$_vpc_repo_lc" ]; then
+          _vpc_ambiguous="1"
+        fi
+      fi
+    fi
+  fi
+
+  if [ -z "$_vpc_ambiguous" ]; then
+    # The registry WINS, and the check must cover every registry shape the
+    # framework supports: `repo: x`, a block `repos:` list, an inline
+    # `repos: [a, b]`, and any of those with a trailing comment (#1451 B2).
+    # A hand-rolled grep missed the inline and commented forms, so reuse the
+    # registry parser instead — its field 6 lists every repo for an entry.
+    # Compare normalised owner/name slugs (#1451 B2-b).
+    _vpc_governed=""
+    if [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ]; then
+      # shellcheck disable=SC1090,SC1091
+      . "$HOOK_DIR/_lib-portfolio-paths.sh"
+    fi
+    if [ -f "$HOOK_DIR/_lib-multi-repo-trace.sh" ]; then
+      # shellcheck disable=SC1090,SC1091
+      . "$HOOK_DIR/_lib-multi-repo-trace.sh"
+    fi
+    if command -v _mrt_parse_registry >/dev/null 2>&1; then
+      _vpc_all_repos=""
+      while IFS= read -r _vpc_reg_raw; do
+        [ -n "$_vpc_reg_raw" ] || continue
+        _vpc_reg_raw=$(printf '%s' "$_vpc_reg_raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        _vpc_reg_lc=$(_vpc_normalize_repo_slug "$_vpc_reg_raw")
+        if [ -z "$_vpc_reg_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring registry repo entry '$_vpc_reg_raw' (not owner/name after normalisation)." >&2
+          continue
+        fi
+        _vpc_all_repos=$(printf '%s\n%s' "$_vpc_all_repos" "$_vpc_reg_lc")
+      done <<EOF
+$(_mrt_parse_registry 2>/dev/null | cut -d'|' -f6 | tr ',' '\n')
+EOF
+      case "
+$_vpc_all_repos
+" in
+        *"
+$_vpc_repo_lc
+"*) _vpc_governed="1" ;;
+      esac
+    else
+      # No parser available: fail closed rather than exempt on a registry we
+      # could not read (#1451 B2, suggested). An unreadable registry must not
+      # be indistinguishable from an empty one.
+      _vpc_governed="1"
+    fi
+
+    if [ -z "$_vpc_governed" ]; then
+      # A-2: listing this checkout's own origin must not disable the local
+      # title check. Resolve origin once; ignore matching list entries.
+      _vpc_origin_lc=""
+      if command -v git_origin_repo >/dev/null 2>&1; then
+        _vpc_origin_lc=$(_vpc_normalize_repo_slug "$(git_origin_repo "$PWD" 2>/dev/null || true)")
+      fi
+      while IFS= read -r _vpc_listed; do
+        [ -n "$_vpc_listed" ] || continue
+        _vpc_listed_lc=$(_vpc_normalize_repo_slug "$_vpc_listed")
+        if [ -z "$_vpc_listed_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring external_contributions entry '$_vpc_listed' (not owner/name after normalisation)." >&2
+          continue
+        fi
+        if [ -n "$_vpc_origin_lc" ] && [ "$_vpc_listed_lc" = "$_vpc_origin_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring external_contributions entry '$_vpc_listed' (matches this checkout's origin; cannot disable the local title check)." >&2
+          continue
+        fi
+        if [ "$_vpc_listed_lc" = "$_vpc_repo_lc" ]; then
+          EXTERNAL_TARGET="1"
+          break
+        fi
+      done <<EOF
+$(config_get '.external_contributions[]' 2>/dev/null)
+EOF
+    fi
+  fi
+  unset _vpc_repo_lc _vpc_ambiguous _vpc_first_line _vpc_first_unquoted \
+        _vpc_create_seg _vpc_repo_tokens _vpc_first_repo _vpc_first_repo_lc \
+        _vpc_governed _vpc_all_repos _vpc_reg_raw _vpc_reg_lc _vpc_listed \
+        _vpc_listed_lc _vpc_origin_lc
+fi
+
+BRANCH_DIR=""
+if [ -n "$CD_TARGET" ]; then
+  CD_TOPLEVEL=$(git -C "$CD_TARGET" rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$CD_TOPLEVEL" ]; then
+    BRANCH_DIR="$CD_TOPLEVEL"
+  fi
+fi
+HEAD_FLAG=$(echo "$COMMAND" | sed -nE 's/.*--head[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+if [ -n "$HEAD_FLAG" ]; then
+  CURRENT_BRANCH="$HEAD_FLAG"
+elif [ -n "$BRANCH_DIR" ]; then
+  CURRENT_BRANCH=$(git -C "$BRANCH_DIR" branch --show-current 2>/dev/null)
+else
+  CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+fi
+ORBIT_RECORDS_OK=0
+ORBIT_RECORDS_REASON=""
+if declare -F orbit_records_branch_shape >/dev/null 2>&1 &&
+   orbit_records_branch_shape "$CURRENT_BRANCH"; then
+  ORBIT_TRUNKS=$(config_get '.branch.trunk_whitelist[]' 2>/dev/null)
+  if [ -z "$ORBIT_TRUNKS" ]; then
+    ORBIT_TRUNKS=$'main\nmaster\ndevelop\ndev\ndevelopment'
+  fi
+  if orbit_records_only "${BRANCH_DIR:-.}" "$CURRENT_BRANCH" "$ORBIT_TRUNKS"; then
+    ORBIT_RECORDS_OK=1
+  fi
+fi
+ORBIT_BODY_INITIATIVE=""
+if [ "$ORBIT_RECORDS_OK" = 1 ] && [[ "$TITLE" == "docs(orbit/$ORBIT_INITIATIVE): "* ]]; then
+  ORBIT_BODY_INITIATIVE="plan-$ORBIT_INITIATIVE"
+fi
 TICKET_REF=""
-if [ -n "$TITLE" ]; then
+if [ -n "$EXTERNAL_TARGET" ]; then
+  echo "NOTE: validate-pr-create.sh: ${CMD_REPO} is listed in .external_contributions — this framework's PR-title convention is not applied. Follow that project's own CONTRIBUTING.md." >&2
+elif [ -n "$TITLE" ]; then
   if ! echo "$TITLE" | grep -qE "^(${PR_TYPES})\(([A-Z]{2,10}-[0-9]+|#[0-9]+)\)!?:"; then
-    ERRORS="${ERRORS}PR title '$TITLE' doesn't match format: type(TICKET-ID): description\n"
-    ERRORS="${ERRORS}Accepted types (from .claude/project-config.*.json → .pr.title_type_whitelist): ${PR_TYPES//|/, }\n"
+    if printf '%s\n' "$TITLE" | grep -qE '^docs\(orbit/[a-z0-9]+(-[a-z0-9]+)*\): [^[:space:]]'; then
+      ORBIT_TITLE=1
+    else
+      ERRORS="${ERRORS}PR title '$TITLE' doesn't match format: type(TICKET-ID): description\n"
+      ERRORS="${ERRORS}Accepted types (from .claude/project-config.*.json → .pr.title_type_whitelist): ${PR_TYPES//|/, }\n"
+    fi
   else
     # Extract the ticket reference so we can verify it exists
     TICKET_REF=$(echo "$TITLE" | sed -nE 's/^[a-z]+\(([^)]+)\):.*/\1/p')
@@ -399,15 +671,31 @@ if [ -n "$TICKET_REF" ]; then
   fi
 
   if [ -n "$TICKET_NUM" ] && { [ "$TRACKER_KIND" != "gh" ] || [ -n "$TRACKER_REPO" ]; }; then
+    # Capture the tracker CLI's own stderr instead of discarding it, so the
+    # paths below that block or warn can name the real cause (#1336). The
+    # upstream lookup overwrites the file, so what survives is the LAST failed
+    # lookup — the quieter of the two options, and the one the two-step lookup
+    # (#207) needs: an ordinary fork-then-upstream miss resolves successfully
+    # and never reaches a branch that reads the file.
+    # Redirect to /dev/null when mktemp fails, rather than to an empty path,
+    # which bash reports as an ambiguous redirect on every lookup. The trap is
+    # set ONLY when mktemp succeeded: an unconditional trap would run
+    # `rm -f /dev/null`, which under root removes the device node and turns
+    # every later redirect to /dev/null on that host into a regular file.
+    if TRACKER_ERR=$(mktemp); then
+      trap 'rm -f "$TRACKER_ERR"' EXIT
+    else
+      TRACKER_ERR=/dev/null
+    fi
     # Dispatch via the tracker lib. For non-gh kinds the {owner_repo}
     # placeholder is supplied but the template may not reference it.
-    ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TRACKER_REPO" 2>/dev/null)
+    ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TRACKER_REPO" 2>"$TRACKER_ERR")
     # Short-circuit: only consult upstream (gh only) when primary missed.
     # Records which tracker actually matched so the CLOSED-state error names
     # the right repo.
     MATCHED_REPO="$TRACKER_REPO"
     if [ -z "$ISSUE_JSON" ] && [ -n "$UPSTREAM_REPO" ]; then
-      ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$UPSTREAM_REPO" 2>/dev/null)
+      ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$UPSTREAM_REPO" 2>"$TRACKER_ERR")
       if [ -n "$ISSUE_JSON" ]; then
         MATCHED_REPO="$UPSTREAM_REPO"
       fi
@@ -421,6 +709,10 @@ if [ -n "$TICKET_REF" ]; then
       # references a real, valid non-GitHub ticket. Hard existence enforcement
       # is retained ONLY for tracker.kind == gh (the block below).
       echo "WARN: validate-pr-create.sh: tracker '${TRACKER_KIND}' not queryable here — ${TICKET_REF} accepted on shape only (no existence check)." >&2
+      if [ -s "$TRACKER_ERR" ]; then
+        echo "Tracker CLI said:" >&2
+        sed 's/^/  /' "$TRACKER_ERR" >&2
+      fi
       ISSUE_JSON=""
       TICKET_NUM=""
     elif [ -z "$ISSUE_JSON" ]; then
@@ -444,6 +736,10 @@ If you were about to file work that has no ticket yet, create one first:
   gh issue create --repo ${TRACKER_REPO} --title "..."
 and use the returned number in your PR title.
 MSG
+      if [ -s "$TRACKER_ERR" ]; then
+        echo "Tracker CLI said:" >&2
+        sed 's/^/  /' "$TRACKER_ERR" >&2
+      fi
       exit 2
     fi
 
@@ -486,16 +782,12 @@ fi
 
 # Check PR body for required sections.
 #
-# The list of required headings is project-configurable via
-# .claude/project-config.*.json (`.pr.required_sections`). Shipped default
-# is ["Testing", "Glossary"] — matches the canonical PR description in
-# `workflows/code-review.md`. Forks extend or restrict per fork.
+# Summary, Testing, Glossary, and a Closes or Refs line are fixed.
+# `.pr.required_sections` may add headings. The shipped list repeats
+# Testing and Glossary for compatibility with existing fork configuration.
 #
 # Supports both --body "..." (inline) and --body-file <path> (file).
 #
-# Skip marker: the literal `.pr.skip_marker` string in the body bypasses
-# the check with a visible stderr WARN. Default marker is
-# `<!-- pr-sections: skip -->`.
 BODY_CONTENT=""
 # Extract --body-file path. Handles --body-file and the -F short form.
 # After continuation normalization (above) the command is one logical line.
@@ -505,11 +797,54 @@ BODY_CONTENT=""
 # file it had just warned it could not read — sending the author to edit a
 # body that was never the problem. Set when a --body-file was named but its
 # content could not be recovered; consumed at the section check below.
+#
+# Hakim / PR #1500: never read --body-file / -F from inside an inline or
+# heredoc --body/-b value. A body that merely mentions `grep -F pattern` or
+# `--body-file notes.md` used to set BODY_FILE to a fake path and fail with
+# "PR body file could not be read". Strip body payloads first, then extract.
 BODY_FILE_UNREADABLE=0
-BODY_FILE=$(printf '%s' "$COMMAND" | sed -nE 's/.*--body-file[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+_cmd_for_bodyfile=$(printf '%s' "$COMMAND" | awk -v SQ="'" '
+  { buf = (NR == 1 ? $0 : buf "\n" $0) }
+  END {
+    s = buf
+    # Heredoc body consumes the rest of the command text.
+    if (match(s, /(^|[[:space:]])(--body|-b)[[:space:]]+("\$\(cat|'\''\$\(cat|\$\(cat)[[:space:]]*<</)) {
+      s = substr(s, 1, RSTART - 1)
+      print s
+      exit
+    }
+    # Double-quoted --body / -b value (first closing quote).
+    if (match(s, /(^|[[:space:]])(--body|-b)[[:space:]]+"/)) {
+      prefix = substr(s, 1, RSTART - 1)
+      rest = substr(s, RSTART + RLENGTH)
+      if (match(rest, /"/)) {
+        s = prefix substr(rest, RSTART + 1)
+      } else {
+        s = prefix
+      }
+    }
+    # Single-quoted --body / -b value.
+    if (match(s, "(^|[[:space:]])(--body|-b)[[:space:]]+" SQ)) {
+      prefix = substr(s, 1, RSTART - 1)
+      rest = substr(s, RSTART + RLENGTH)
+      if (match(rest, SQ)) {
+        s = prefix substr(rest, RSTART + 1)
+      } else {
+        s = prefix
+      }
+    }
+    # Unquoted single-token --body / -b value.
+    if (match(s, /(^|[[:space:]])(--body|-b)[[:space:]]+[^[:space:]]+/)) {
+      s = substr(s, 1, RSTART - 1) substr(s, RSTART + RLENGTH)
+    }
+    print s
+  }
+')
+BODY_FILE=$(printf '%s' "$_cmd_for_bodyfile" | sed -nE 's/.*--body-file[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
 if [ -z "$BODY_FILE" ]; then
-  BODY_FILE=$(printf '%s' "$COMMAND" | sed -nE 's/.*[[:space:]]-F[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+  BODY_FILE=$(printf '%s' "$_cmd_for_bodyfile" | sed -nE 's/.*[[:space:]]-F[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
 fi
+unset _cmd_for_bodyfile
 # #1038 — strip ONE matched surrounding quote pair.
 #
 # The `[^[:space:]]+` token grab above is quote-blind, so `--body-file
@@ -527,6 +862,21 @@ case "$BODY_FILE" in
   '"'*'"') BODY_FILE=${BODY_FILE#\"}; BODY_FILE=${BODY_FILE%\"} ;;
   "'"*"'") BODY_FILE=${BODY_FILE#\'}; BODY_FILE=${BODY_FILE%\'} ;;
 esac
+# `--body-file -` reads the body from stdin (usually a heredoc in the same
+# command). There is no file to read: check the command text instead.
+[ "$BODY_FILE" = "-" ] && BODY_FILE=""
+# An inline body flag after `pr create` (--body, --body=, -b). The body-file
+# extraction above cannot parse every quoting shape (escaped quotes, the
+# --body= form), so a fake path can come out of an inline body. The CLI
+# refuses --body together with --body-file, so when an inline body is
+# present and the named file cannot be read, check the command text as
+# `dev` did instead of reporting an unreadable file.
+_pr_create_tail=$(printf '%s' "$COMMAND" | sed -n '/pr[[:space:]][[:space:]]*create/,$p' | sed '1s/.*pr[[:space:]][[:space:]]*create//')
+HAS_INLINE_BODY=0
+if printf '%s' "$_pr_create_tail" | grep -qE '(^|[[:space:]])(--body(=|[[:space:]])|-b[[:space:]])'; then
+  HAS_INLINE_BODY=1
+fi
+unset _pr_create_tail
 if [ -n "$BODY_FILE" ]; then
   # Resolve relative paths against the command's cd-target (if any), so
   # 'cd /project && gh pr create --body-file body.md' finds the file at
@@ -542,77 +892,79 @@ if [ -n "$BODY_FILE" ]; then
     if [ -z "$BODY_CONTENT" ] && [ -s "$BODY_FILE" ]; then
       BODY_FILE_UNREADABLE=1
     fi
+  elif [ "$HAS_INLINE_BODY" -eq 1 ]; then
+    # Not a real body file: the path came out of an inline body. Check the
+    # command text, which holds the inline body.
+    BODY_FILE=""
   else
     echo "WARN: validate-pr-create.sh: --body-file '${BODY_FILE}' not readable from hook context; section check may miss content." >&2
     BODY_FILE_UNREADABLE=1
   fi
 fi
 
-if echo "$COMMAND" | grep -qE '\-\-body(-file)?\b'; then
+if echo "$COMMAND" | grep -qE '\-\-body(-file)?\b|[[:space:]]-F[[:space:]]'; then
   # Combined haystack — scan both the file content (if --body-file) and the
   # raw command (so inline --body "..." also matches).
   HAYSTACK=$(printf '%s\n%s\n' "$BODY_CONTENT" "$COMMAND")
 
-  # Load required sections + skip marker from project config (shared reader).
-  # Source via HOOK_DIR so this works regardless of cwd (inside a workspace
-  # clone, REPO_ROOT would point at the project — _lib-read-config.sh itself
-  # resolves the config files relative to the ops fork).
-  # shellcheck disable=SC1090,SC1091
-  REQUIRED_SECTIONS=""
-  PR_SKIP_MARKER=""
-  if [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
-    . "$HOOK_DIR/_lib-read-config.sh"
-    REQUIRED_SECTIONS=$(config_get '.pr.required_sections[]' 2>/dev/null)
-    PR_SKIP_MARKER=$(config_get_or '.pr.skip_marker' '<!-- pr-sections: skip -->' 2>/dev/null)
-  fi
-  # Fallbacks for bare checkouts predating the config schema.
-  if [ -z "$REQUIRED_SECTIONS" ]; then
-    REQUIRED_SECTIONS=$(printf 'Testing\nGlossary')
-  fi
-  if [ -z "$PR_SKIP_MARKER" ]; then
-    PR_SKIP_MARKER='<!-- pr-sections: skip -->'
-  fi
-
-  # Skip marker short-circuits with a visible warning.
-  if echo "$HAYSTACK" | grep -qF -- "$PR_SKIP_MARKER"; then
-    echo "WARN: pr-sections check bypassed by skip marker ($PR_SKIP_MARKER) in PR body." >&2
+  if [ -n "$EXTERNAL_TARGET" ]; then
+    echo "NOTE: validate-pr-create.sh: ${CMD_REPO} is listed in .external_contributions — apexyard body rules do not apply to an external contribution. Follow that project's own CONTRIBUTING.md." >&2
   else
-    # For each required heading, grep for `## <heading>` (case-insensitive).
-    MISSING_SECTIONS=""
-    while IFS= read -r section; do
-      [ -z "$section" ] && continue
-      # Escape regex metachars in the section name so names like "Given / When / Then" work.
-      section_re=$(printf '%s' "$section" | sed 's/[][\.^$*+?(){}|]/\\&/g')
-      if ! echo "$HAYSTACK" | grep -qiE "^##[[:space:]]+${section_re}\b"; then
-        MISSING_SECTIONS="${MISSING_SECTIONS}${section}\n"
-      fi
-    done <<EOF
-${REQUIRED_SECTIONS}
-EOF
-
-    if [ -n "$MISSING_SECTIONS" ]; then
-      if [ "$BODY_FILE_UNREADABLE" -eq 1 ]; then
-        # me2resh/apexyard#1058: sections appear absent, but the body file was
-        # never read — so their absence is unproven. Report the cause we
-        # actually have evidence for. Still fail closed (a body we cannot
-        # inspect is not a body we can pass), just stop misdirecting the fix.
-        # Name the sections explicitly. An earlier draft said "the sections
-        # above", which referred to nothing — this branch replaces the
-        # per-section list rather than following it, so the author was left
-        # without the one fact they need. On a fix whose whole subject is
-        # message accuracy, a dangling reference is the wrong thing to ship.
-        _unchecked=$(printf '%b' "$MISSING_SECTIONS" | sed '/^$/d' | sed 's/^/## /' | paste -sd, - | sed 's/,/, /g')
-        ERRORS="${ERRORS}PR body file could not be read: ${BODY_FILE}\n"
-        ERRORS="${ERRORS}  The required-section check was NOT run, so these are UNVERIFIED, not missing: ${_unchecked}\n"
-        ERRORS="${ERRORS}  Fix the path (check for a typo, or make it absolute) and retry.\n"
+    # Load additional required sections from project config (shared reader).
+    # Source via HOOK_DIR so this works regardless of cwd (inside a workspace
+    # clone, REPO_ROOT would point at the project — _lib-read-config.sh itself
+    # resolves the config files relative to the ops fork).
+    # shellcheck disable=SC1090,SC1091
+    REQUIRED_SECTIONS=""
+    if [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
+      . "$HOOK_DIR/_lib-read-config.sh"
+      REQUIRED_SECTIONS=$(config_get '.pr.required_sections[]' 2>/dev/null)
+    fi
+    # Fallbacks for bare checkouts predating the config schema.
+    if [ -z "$REQUIRED_SECTIONS" ]; then
+      REQUIRED_SECTIONS=$(printf 'Testing\nGlossary')
+    fi
+    # The AgDR-0161 validator is shared with Rex and Tariq. Do not treat
+    # an unreadable body as evidence that any section is missing.
+    # shellcheck source=/dev/null
+    if ! . "$HOOK_DIR/_lib-review-markers.sh"; then
+      echo "validate-pr-create.sh: review validator unavailable" >&2
+      exit 2
+    fi
+    if [ "$BODY_FILE_UNREADABLE" -eq 1 ]; then
+      _unchecked=$(printf '%s\nSummary\nTesting\nGlossary\n' "$REQUIRED_SECTIONS" | sed '/^$/d' | sed 's/^/## /' | paste -sd, - | sed 's/,/, /g')
+      ERRORS="${ERRORS}PR body file could not be read: ${BODY_FILE}\n"
+      ERRORS="${ERRORS}  The required-section check was NOT run, so these are UNVERIFIED, not missing: ${_unchecked}; Closes or Refs line.\n"
+      ERRORS="${ERRORS}  Fix the path (check for a typo, or make it absolute) and retry.\n"
+    else
+      if [ -n "$BODY_FILE" ]; then
+        review_validate_body pr "$BODY_FILE" "$REQUIRED_SECTIONS" "${ORBIT_BODY_INITIATIVE:-}" 2>/dev/null
       else
-        # The body WAS read and the sections genuinely are not in it.
-        while IFS= read -r section; do
-          [ -z "$section" ] && continue
-          ERRORS="${ERRORS}PR body missing required '## ${section}' section.\n"
-        done <<EOF
-$(printf '%b' "$MISSING_SECTIONS")
+        # review_validate_body requires a regular file (-f). A process-substitution
+        # fd is not a regular file on Linux, so materialise HAYSTACK via mktemp.
+        _pr_body_temp=$(mktemp) || {
+          echo "validate-pr-create.sh: could not create body check file" >&2
+          exit 2
+        }
+        printf '%s\n' "$HAYSTACK" > "$_pr_body_temp"
+        review_validate_body pr "$_pr_body_temp" "$REQUIRED_SECTIONS" "${ORBIT_BODY_INITIATIVE:-}" 2>/dev/null
+        rm -f "$_pr_body_temp"
+      fi
+      if [ "$REVIEW_VALIDATION_RESULT" != complete ]; then
+        if [ -z "$REVIEW_VALIDATION_MISSING" ]; then
+          ERRORS="${ERRORS}PR body failed completeness validation.\n"
+        else
+          while IFS= read -r section; do
+            [ -z "$section" ] && continue
+            if [ "$section" = 'Closes or Refs line' ]; then
+              ERRORS="${ERRORS}PR body missing required Closes or Refs line.\n"
+            else
+              ERRORS="${ERRORS}PR body missing required '## ${section}' section.\n"
+            fi
+          done <<EOF
+${REVIEW_VALIDATION_MISSING}
 EOF
+        fi
       fi
     fi
   fi
@@ -725,20 +1077,11 @@ fi
 # the PR-title check above is independent of cwd.
 # CD_TARGET was extracted early (near top of script) for --body-file path
 # resolution; reuse it here for the branch-name fallback below.
-BRANCH_DIR=""
-if [ -n "$CD_TARGET" ]; then
-  CD_TOPLEVEL=$(git -C "$CD_TARGET" rev-parse --show-toplevel 2>/dev/null)
-  if [ -n "$CD_TOPLEVEL" ]; then
-    BRANCH_DIR="$CD_TOPLEVEL"
+if [ "$ORBIT_TITLE" = 1 ] && [ -z "$ORBIT_BODY_INITIATIVE" ]; then
+  ERRORS="${ERRORS}PR title 'docs(orbit/<initiative-id>): ...' is allowed only on an orbit/<initiative-id>-<description> branch that changes only files under docs/orbit/. Use the normal shape type(TICKET-ID): description and a {type}/{TICKET-ID}-{description} branch.\n"
+  if [ -n "$ORBIT_RECORDS_REASON" ]; then
+    ERRORS="${ERRORS}${ORBIT_RECORDS_REASON}\n"
   fi
-fi
-HEAD_FLAG=$(echo "$COMMAND" | sed -nE 's/.*--head[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
-if [ -n "$HEAD_FLAG" ]; then
-  CURRENT_BRANCH="$HEAD_FLAG"
-elif [ -n "$BRANCH_DIR" ]; then
-  CURRENT_BRANCH=$(git -C "$BRANCH_DIR" branch --show-current 2>/dev/null)
-else
-  CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
 fi
 if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && [ "$CURRENT_BRANCH" != "master" ]; then
   # Release-cut branches are exempt — same recognition `validate-branch-name.sh`
@@ -750,8 +1093,17 @@ if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && [ "$CURRENT_BR
   # `sync(#N):`, which the title check above validates.
   if echo "$CURRENT_BRANCH" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$|^sync/main-to-dev-after-v[0-9]+\.[0-9]+\.[0-9]+$'; then
     :  # release-cut or release-sync branch, exempt — fall through to the rest of the validator
+  elif [ -n "$EXTERNAL_TARGET" ]; then
+    :  # External contribution (#1448/#1451 B3): the branch belongs to the
+       # contributor's own fork and the destination project has its own
+       # naming conventions, so a framework ticket ID is not required here.
+  elif [ "$ORBIT_RECORDS_OK" = 1 ]; then
+    : # Records branch, validated against remote trunk refs.
   elif ! echo "$CURRENT_BRANCH" | grep -qE '[A-Z]{2,10}-[0-9]+|GH-[0-9]+|#[0-9]+'; then
     ERRORS="${ERRORS}Branch '$CURRENT_BRANCH' missing ticket ID.\n"
+    case "$CURRENT_BRANCH" in
+      orbit/*) ERRORS="${ERRORS}Use the normal shape {type}/{TICKET-ID}-{description}.\n" ;;
+    esac
   fi
 fi
 

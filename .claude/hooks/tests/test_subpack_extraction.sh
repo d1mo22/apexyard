@@ -20,6 +20,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd)"
 
@@ -98,6 +103,7 @@ SAFETY_EXPECTED=(
   ".claude/hooks/_lib-read-config.sh"
   ".claude/hooks/_lib-ops-root.sh"
   ".claude/hooks/_lib-extract-pr.sh"
+  ".claude/hooks/_lib-git-global.sh"
   "EXTRACTION_MANIFEST.json"
 )
 for f in "${SAFETY_EXPECTED[@]}"; do

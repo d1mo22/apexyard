@@ -1,7 +1,7 @@
 # Topology: TypeScript Next.js Web App
 
-**Version**: 1.0.0
-**Stack**: TypeScript + Next.js (App Router) + Prisma ORM + Vercel/Node.js runtime
+**Version**: 1.1.0
+**Stack**: TypeScript + Next.js (App Router) + Drizzle ORM with sql.js + Vercel/Node.js runtime
 **Use this when**: building a SaaS web app with API routes, server components, a relational DB, and a per-tenant auth model.
 
 ## What this topology bundles
@@ -18,7 +18,7 @@ Pick this topology in `/handover` and the skill instantiates the following into 
 
 ## Why pick this topology
 
-Next.js is one of the most opinionated web frameworks in the TypeScript ecosystem — it dictates routing, data loading, server-vs-client boundaries, and image optimisation. Combined with TS strict mode and a typed ORM (Prisma), the **ambient affordances** are high: the framework already enforces most of the structural rules a code reviewer would otherwise have to surface. ApexYard's harness leans into that — variety reduction per Ashby's Law (see AgDR-0048).
+Next.js is one of the most opinionated web frameworks in the TypeScript ecosystem — it dictates routing, data loading, server-vs-client boundaries, and image optimisation. Combined with TS strict mode and a typed ORM (Drizzle ORM with sql.js, AgDR-0240), the **ambient affordances** are high: the framework already enforces most of the structural rules a code reviewer would otherwise have to surface. ApexYard's harness leans into that — variety reduction per Ashby's Law (see AgDR-0048).
 
 If your codebase uses TypeScript but **not** Next.js (e.g. Express + React SPA, Vite + standalone API), this topology will over-fit. Run `/handover` without picking a topology and lean on the framework's universal handbooks.
 
@@ -27,7 +27,7 @@ If your codebase uses TypeScript but **not** Next.js (e.g. Express + React SPA, 
 | Affordance | How it's provided | Why it matters to Rex |
 |------------|-------------------|------------------------|
 | Strict TypeScript | `tsconfig.json` with `"strict": true` + `"noUncheckedIndexedAccess": true` | Rex's `language/typescript/strict-mode.md` handbook fires cleanly; blocking enforcement is safe |
-| Module boundaries | `app/` (UI) + `lib/` (utilities) + `prisma/` (data) + `domain/` (business logic, optional) | Clean-architecture handbook can flag layer violations |
+| Module boundaries | `app/` (UI) + `lib/` (utilities) + `src/infrastructure/` (data, Drizzle ORM with sql.js) + `domain/` (business logic, optional) | Clean-architecture handbook can flag layer violations |
 | Framework opinionation | Next.js App Router conventions; file-system routing; React Server Components | Domain handbooks on routing patterns are enforceable |
 | Test coverage signal | `vitest.config.ts` with `coverage.thresholds` block (recommended) | Coverage gates apply |
 | Lint baseline | `eslint.config.js` extending `next/core-web-vitals` | ESLint integration is the baseline |
@@ -56,6 +56,7 @@ typescript-nextjs/
 │       │   └── session-handling.md                           ← paths: app/api/auth/**, middleware.ts
 │       └── nextjs-data/
 │           └── loading-patterns.md                           ← paths: app/**/page.tsx, lib/data/**
+├── starter/                                                  ← Next.js source tree
 ├── golden-paths/
 │   └── nextjs-ci.yml                                         ← typecheck + lint + test + build + bundle-size
 └── templates/
@@ -67,3 +68,10 @@ typescript-nextjs/
 When `/update` detects this topology's framework `VERSION` is ahead of the instantiated copy at `handbooks/architecture/clean-architecture-layers.md` etc., it offers per-file diff acceptance. Default is **skip** — the operator owns each change, same convention as the deprecated-config-key offer in `/update` step 8 (see AgDR-0032).
 
 To force a clean re-instantiation: delete the instantiated files and re-run `/handover --topology typescript-nextjs`. The skill never overwrites without confirmation.
+
+## Starter
+
+Version 1.1.0 adds `starter/`.
+The starter uses Next.js, TypeScript strict mode, and Vitest.
+The local store is Drizzle ORM with sql.js.
+See `starter/README.md` for the commands.

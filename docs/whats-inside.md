@@ -37,10 +37,10 @@ apexyard/
 │
 ├── .claude/               # Claude Code primitives (the runnable layer)
 │   ├── settings.json      # Hook wiring (PreToolUse, PostToolUse, SessionStart)
-│   ├── hooks/             # 60 shell scripts — ticket-first, migration gate, two-marker merge gate, red-CI block, secrets scan, branch/PR validation, leak protection, MCP-reindex advisories, upstream-drift banner
+│   ├── hooks/             # 55 shell scripts — ticket-first, ORBIT slice gate, migration gate, two-marker merge gate, red-CI block, secrets scan, branch/PR validation, leak protection, upstream-drift banner
 │   ├── rules/             # 22 modular rule files. CLAUDE.md indexes them by name.
 │   ├── agents/            # 23 sub-agents — Rex (Code Reviewer), Hakim (Security Auditor), Tariq (Solution Architect), the engineering / product / design / data / security personas, plus utility agents (dependency auditor, The Contrarian)
-│   └── skills/            # 66 slash commands — see CLAUDE.md for the full list
+│   └── skills/            # 68 slash commands — see CLAUDE.md for the full list
 │
 ├── workspace/             # Live local clones of managed projects — gitignored
 ├── projects/              # Per-project committed docs (README, roadmap, AgDRs, updates)
@@ -163,10 +163,10 @@ Code loads it when it is at the repository root.
 
 | Layer | Path | What it is |
 |-------|------|------------|
-| **Hooks** | `.claude/hooks/` | 60 shell scripts that mechanically enforce SDLC rules — ticket-first edits (Edit/Write/Bash), migration-ticket-first, auto code review, merge gates (Rex + CEO + design + architecture review), red-CI block, commit-format, AgDR-for-arch-changes, branch/PR-title validation, secrets scanning, private-ref leak protection, upstream-drift banner, MCP-reindex advisories |
+| **Hooks** | `.claude/hooks/` | 55 shell scripts that mechanically enforce SDLC rules — ticket-first edits (Edit/Write/Bash), ORBIT slice before Feature/Task issues, migration-ticket-first, auto code review, merge gates (Rex + CEO + design + architecture review), red-CI block, commit-format, AgDR-for-arch-changes, branch/PR-title validation, secrets scanning, private-ref leak protection, upstream-drift banner |
 | **Rules** | `.claude/rules/` | 22 modular rule files. CLAUDE.md indexes them by name. |
 | **Agents** | `.claude/agents/` | 23 sub-agents — the department personas plus utility agents |
-| **Skills** | `.claude/skills/` | 66 slash commands |
+| **Skills** | `.claude/skills/` | 68 slash commands |
 | **Settings** | `.claude/settings.json` | Wires hooks to `PreToolUse`, `PostToolUse`, and `SessionStart` events |
 
 ### The 22 rule files
@@ -177,12 +177,12 @@ Code loads it when it is at the repository root.
 
 Utility agents: **Rex** (`code-reviewer`), **Hakim** (`security-reviewer`), **Tariq** (`solution-architect`), **Naqid** (`contrarian`), plus `dependency-auditor`. The remaining 18 are the department-role agents (engineering, product, design, security, data — one per role file).
 
-### The 66 skills
+### The 68 skills
 
 The full, one-line-per-skill list lives in [`CLAUDE.md`](../CLAUDE.md) under "Available skills". Highlights by category:
 
 - **Bootstrap & sync** — `/setup`, `/handover`, `/update`, `/split-portfolio`
-- **Planning & tickets** — `/write-spec`, `/plan-initiative`, `/feature`, `/bug`, `/task`, `/tickets-batch`, `/spike`, `/prototype`, `/walking-skeleton`, `/migration`, `/investigation`, `/idea`
+- **Planning & tickets** — `/scaffold`, `/write-spec`, `/plan-initiative`, `/feature`, `/bug`, `/task`, `/tickets-batch`, `/spike`, `/prototype`, `/walking-skeleton`, `/migration`, `/investigation`, `/idea`
 - **Review & decisions** — `/decide`, `/agdr`, `/code-review`, `/security-review`, `/design-review`, `/challenge`, `/approve-merge`, `/approve-design`, `/approve-architecture`
 - **Audits** — `/launch-check`, `/threat-model`, `/accessibility-audit`, `/compliance-check`, `/analytics-audit`, `/seo-audit`, `/geo-audit`, `/performance-audit`, `/monitoring-audit`, `/docs-audit`, `/mutation-test`, `/audit-deps`
 - **Architecture & diagrams** — `/c4`, `/dfd`, `/tech-vision`, `/journey`, `/feature-diagram`, `/extract-features`, `/process`

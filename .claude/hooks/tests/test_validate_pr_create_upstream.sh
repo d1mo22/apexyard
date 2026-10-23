@@ -17,6 +17,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/validate-pr-create.sh"
 # shellcheck source=_lib-mock-gh.sh
 source "$(cd "$(dirname "$0")" && pwd)/_lib-mock-gh.sh"
@@ -49,6 +54,8 @@ make_sandbox_fork() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   local src_root
   src_root=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -63,7 +70,7 @@ make_sandbox_fork() {
 # Minimal PR body with the required Testing + Glossary sections so the body
 # check isn't what trips the validator. We're testing the ticket-existence
 # fallback, not the body parser.
-BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |'
+BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |\n\nRefs #207'
 
 # Build a `gh pr create` command. Pass `with_repo_flag=yes` to include
 # `--repo me2resh/apexyard` (forces TRACKER_REPO=me2resh/apexyard regardless

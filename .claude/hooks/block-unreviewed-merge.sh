@@ -40,8 +40,13 @@
 #   approved_by=user            # signals "this was a human, not the model"
 #   skill_version=<N>           # N >= 2; bare-SHA legacy markers rejected
 #
+# A menu record (AgDR-0234) also has approval_channel=menu and
+# skill_version=3. record-menu-approval.sh is the only supported writer.
+# The typed /approve-merge path omits approval_channel and stays at
+# skill_version=2. Carry-over rules are the same for both.
+#
 # Other fields (approved_at, approval_summary) are written by the skill
-# but not validated by the hook — they're an audit trail, not a check.
+# or the menu hook. The menu path checks them. The typed path does not.
 #
 # Claude could in principle still forge the structured fields. But the
 # act of typing out `approved_by=user` etc. is a visible, auditable,
@@ -75,7 +80,8 @@ INPUT=$(cat)
 # builtin, so it never triggers that behavior; this function never calls
 # `.` on a path it has not already confirmed is readable.
 _require_lib() {
-  local lib="$1"
+  local lib="$1" fn
+  shift
   if [ ! -r "$lib" ]; then
     echo "BLOCKED: merge gate cannot load a required library." >&2
     echo "Missing or unreadable: $lib" >&2
@@ -91,6 +97,12 @@ _require_lib() {
     echo "instead of skipping the check. Fix the file and retry." >&2
     exit 2
   fi
+  for fn in "$@"; do
+    if ! command -v "$fn" >/dev/null 2>&1 || ! declare -F "$fn" >/dev/null 2>&1; then
+      printf 'BLOCKED: merge gate missing required function %s after sourcing %s. Restore the library and retry.\n' "$fn" "$lib" >&2
+      exit 2
+    fi
+  done
 }
 
 # Shared merge-shape detector + PR-number parser (see _lib-extract-pr.sh).
@@ -99,9 +111,15 @@ _require_lib() {
 # original position after the parse) so is_merge_command is available as
 # the jq-independent fallback detector when the parse can't be trusted —
 # see #965.
-_require_lib "$(dirname "$0")/_lib-extract-pr.sh"
+_require_lib "$(dirname "$0")/_lib-extract-pr.sh" \
+  is_merge_command is_merge_command_raw \
+  _run_awk_or_fallback join_shell_continuations _join_shell_continuations_fallback \
+  _scrub_merge_command _has_split_merge_phrase _normalize_json_escapes \
+  has_conflicting_repo_flags merge_command_uses_variable extract_pr_number resolve_merge_repo \
+  resolve_pr_head resolve_pr_head_branch resolve_pr_base_ref
 # Repo-qualified marker path helper (#485).
-_require_lib "$(dirname "$0")/_lib-review-markers.sh"
+_require_lib "$(dirname "$0")/_lib-review-markers.sh" \
+  review_marker_path unqualified_marker_hint
 # Behind-base detection independent of the forge's mergeStateStatus field
 # (me2resh/apexyard#1386 — see _lib-merge-behind.sh for why). Optional, not
 # a _require_lib dependency: this library only appends an advisory note to
@@ -164,18 +182,30 @@ if [ -z "$COMMAND" ]; then
   # hook sees. A payload that DOES look merge-shaped but that we can't
   # safely parse/verify fails CLOSED (exit 2) instead of silently letting
   # an ungated merge through.
-  if is_merge_command "$(_normalize_json_escapes "$INPUT")"; then
+  if is_merge_command_raw "$(_normalize_json_escapes "$INPUT")"; then
     echo "BLOCKED: merge gate cannot evaluate this command — jq is unavailable or .tool_input.command could not be parsed, but the raw input looks merge-related. Refusing to merge until this can be verified. Restore jq (see .claude/hooks/check-jq-installed.sh) and retry." >&2
     exit 2
   fi
   exit 0
 fi
 
+_has_split_merge_phrase "$COMMAND"
+scan_status=$?
+if [ "$scan_status" -eq 2 ]; then
+  echo "BLOCKED: merge gate could not scan the command. Check awk and the command size." >&2
+  exit 2
+fi
+
 if ! is_merge_command "$COMMAND"; then
   exit 0
 fi
 
-if merge_command_uses_variable "$COMMAND"; then
+if has_conflicting_repo_flags "$COMMAND"; then
+  echo "BLOCKED: merge command has conflicting repo flags. Re-run with one repo value." >&2
+  exit 2
+fi
+
+if merge_command_uses_variable "$COMMAND" "$scan_status"; then
   echo "BLOCKED: merge gate cannot resolve a merge command containing an unexpanded PR or repo variable. Re-run with literal values." >&2
   exit 2
 fi
@@ -313,6 +343,16 @@ MSG
   exit 2
 fi
 
+# Base branch name, resolved ONCE from the forge and reused by both the
+# carry-over checks below and print_behind_base_note — avoids three
+# separate `gh pr view ... baseRefName` calls for the same PR. Empty when
+# CMD_REPO is empty (an unscoped --repo, see the #887 note further down);
+# every caller of $BASE_REF_NAME already degrades correctly on empty (the
+# carry-over functions require it non-empty and return "unknown" without
+# it; print_behind_base_note already skips on empty CMD_REPO first).
+# resolve_pr_base_ref reads the dispatcher snapshot first (AgDR-0256).
+BASE_REF_NAME=$(resolve_pr_base_ref "$PR_NUMBER" "${CMD_REPO:-}")
+
 # --- Optional behind-base note, shared by the two blocks below (#1386) ---
 # Advisory only — it adds NO new blocking condition. Both call sites already
 # block for another reason (a missing or stale Rex marker); this only
@@ -345,7 +385,7 @@ print_behind_base_note() {
     return 0
   fi
   local base behind
-  base=$(gh pr view "$PR_NUMBER" --repo "$CMD_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null)
+  base="${BASE_REF_NAME:-}"
   behind=$(is_pr_behind_base "$CMD_REPO" "$base" "$CURRENT_SHA")
   if [ "$behind" = "true" ]; then
     cat >&2 <<MSG3
@@ -407,7 +447,38 @@ MSG
 fi
 
 REX_SHA=$(tr -d '[:space:]' < "$REX_APPROVAL")
-if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ]; then
+# --- Carry the Rex approval across a verified base-branch merge (#1437, #1456) ---
+# When HEAD moved because the PR was refreshed against its base — not
+# because new work landed — and that refresh is a conflict-free two-parent
+# merge of the Rex-approved commit, the marker's original SHA no longer
+# matches HEAD even though nothing Rex reviewed actually changed.
+# rex_approval_carries_over (_lib-merge-behind.sh) verifies this against the
+# FORGE, not local git state: parent[0] must equal REX_SHA per the forge
+# commit API, parent[1] must be an ancestor of the base branch's CURRENT tip
+# (resolved via the branches endpoint so a tag cannot shadow the name), and
+# a `git merge-tree --write-tree` of the two parents must reproduce the
+# forge-reported tree for HEAD — run in a fresh empty GIT_DIR that reads
+# objects only through alternates, so a local merge driver or grafts entry
+# cannot change the result. Fails closed on any uncertainty — an
+# unresolvable base tip, a missing object, a failed fetch, a non-merge
+# commit, an octopus merge, a second parent not on the base branch, or a
+# merge-tree mismatch all fall through to the ordinary stale-marker block
+# below. No agent writes a marker for this. The gate decides on its own,
+# from state a local file write cannot fabricate.
+_CARRY_OVER="false"
+if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ] \
+   && command -v rex_approval_carries_over >/dev/null 2>&1; then
+  # Call in this shell (not only via `$()`) so the GraphQL memo stays for
+  # the CEO check below (#1796).
+  rex_approval_carries_over "${CMD_REPO:-}" "$REX_SHA" "$CURRENT_SHA" "${BASE_REF_NAME:-}" >/dev/null
+  _CARRY_OVER="${_REX_CARRY_LAST:-unknown}"
+fi
+if [ "$_CARRY_OVER" = "timeout" ]; then
+  # apexyard_gh already printed the BLOCKED timeout line (#1796).
+  exit 2
+fi
+if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ] \
+   && [ "$_CARRY_OVER" != "true" ]; then
   cat >&2 <<MSG
 BLOCKED: Code-reviewer approved commit ${REX_SHA:0:7} but HEAD is now ${CURRENT_SHA:0:7}.
 
@@ -542,6 +613,21 @@ fi
 # in-memory and let the command through if it's valid. See #426.
 _INLINE_CEO_MARKER=""
 if [ ! -f "$CEO_APPROVAL" ]; then
+  # A menu record is written by record-menu-approval.sh before the merge
+  # command runs. A merge command that contains approval_channel=menu is
+  # the model writing the record itself. Refuse that inline shape.
+  if printf '%s\n' "$COMMAND" | grep -q 'approval_channel=menu'; then
+    cat >&2 <<MSG
+BLOCKED: PR #${PR_NUMBER} menu approval cannot be written inside the merge command.
+
+The menu record is written by record-menu-approval.sh after the operator
+selects the approve option. A merge command that contains
+approval_channel=menu is not that hook.
+
+Use the approval menu, or run /approve-merge ${PR_NUMBER}.
+MSG
+    exit 2
+  fi
   # Look for inline marker content in the command targeting this PR's
   # approval file. Match heredoc, printf, or echo writing to *-ceo.approved.
   # Match both the new repo-qualified basename and the bare-number legacy form
@@ -578,11 +664,14 @@ Missing file:
 To unblock:
   1. Stop and tell the ${APPROVER_TITLE} the PR is ready, naming it:
      "PR #${PR_NUMBER} is ready to merge."
-  2. Ask THEM to run the skill. Since #1042 it is human-only
+  2. Ask THEM to approve. Since #1042 the skill is human-only
      (disable-model-invocation: true) — you cannot invoke it:
        /approve-merge ${PR_NUMBER}
-  3. Their invocation writes the structured marker AND runs the merge in
-     one turn. Your job ends at step 1.
+     Or show the approval menu. The question must name the repo, the PR,
+     and the full head SHA. record-menu-approval.sh writes the marker
+     when the operator selects the approve option. Do not write it yourself.
+  3. The typed skill writes the structured marker AND runs the merge in
+     one turn. The menu writes the marker only. Your job ends at step 1.
 
 NEVER create this marker yourself. You have no path to it, and that is the
 point: the invocation IS the approval, so it must come from a human.
@@ -667,7 +756,64 @@ MSG
   exit 2
 fi
 
-if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ]; then
+# Menu records are skill_version=3 plus approval_channel=menu.
+# A typed marker has no channel. Any other channel is rejected.
+CEO_CHANNEL=""
+if [ "$_INLINE_CEO_MARKER" != "valid" ]; then
+  CEO_CHANNEL=$(grep '^approval_channel=' "$CEO_APPROVAL" 2>/dev/null || true)
+fi
+if [ -n "$CEO_CHANNEL" ] && [ "$CEO_CHANNEL" != "approval_channel=menu" ]; then
+  cat >&2 <<MSG
+BLOCKED: PR #${PR_NUMBER} ${APPROVER_TITLE} marker has ${CEO_CHANNEL}.
+
+The merge gate accepts no channel, or approval_channel=menu from the
+approval menu. Re-record via /approve-merge ${PR_NUMBER} or the menu.
+MSG
+  exit 2
+fi
+if [ "$CEO_CHANNEL" = "approval_channel=menu" ]; then
+  _menu_lib="$(dirname "$0")/_lib-menu-approval.sh"
+  if [ ! -r "$_menu_lib" ]; then
+    echo "BLOCKED: merge gate cannot load _lib-menu-approval.sh." >&2
+    exit 2
+  fi
+  # shellcheck source=/dev/null
+  . "$_menu_lib"
+  if ! menu_approval_record_sha "$CEO_APPROVAL" >/dev/null; then
+    cat >&2 <<MSG
+BLOCKED: PR #${PR_NUMBER} menu approval record is invalid.
+
+A menu record needs sha, approved_by=user, skill_version=3,
+approval_channel=menu, approved_at, and approval_summary.
+record-menu-approval.sh writes that shape. Re-run the approval menu.
+MSG
+    exit 2
+  fi
+fi
+
+# Same forge-verified carry-over applies to the CEO marker (#1437) — this is
+# a deliberate CEO decision, not an oversight: the marker and the merge are
+# one authorization moment (.claude/rules/pr-workflow.md), and that moment
+# is preserved, not re-litigated, when the ONLY thing that changed is a
+# mechanically-verified, conflict-free replay of the base branch the CEO
+# never reviewed content from. See AgDR-0178 "CEO marker carry-over is a
+# CEO decision" for the full reasoning. Re-checks the SAME condition
+# independently (never assumes the Rex-side check above already proved it)
+# — this comparison uses CEO_SHA, not REX_SHA, as parent[0].
+_CEO_CARRY_OVER="false"
+if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ] \
+   && command -v rex_approval_carries_over >/dev/null 2>&1; then
+  # Same process as the Rex walk — reuses the memoised chain when the head
+  # and base match (#1796).
+  rex_approval_carries_over "${CMD_REPO:-}" "$CEO_SHA" "$CURRENT_SHA" "${BASE_REF_NAME:-}" >/dev/null
+  _CEO_CARRY_OVER="${_REX_CARRY_LAST:-unknown}"
+fi
+if [ "$_CEO_CARRY_OVER" = "timeout" ]; then
+  # apexyard_gh already printed the BLOCKED timeout line (#1796).
+  exit 2
+fi
+if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ] \
+   && [ "$_CEO_CARRY_OVER" != "true" ]; then
   cat >&2 <<MSG
 BLOCKED: ${APPROVER_TITLE} approved commit ${CEO_SHA:0:7} but HEAD is now ${CURRENT_SHA:0:7}.
 

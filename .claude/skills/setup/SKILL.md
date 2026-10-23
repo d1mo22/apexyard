@@ -6,9 +6,7 @@ argument-hint: "[--reset] [--enable-lsp]"
 effort: medium
 ---
 
-## Writing rule
-
-When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /setup — ApexYard First-Run Bootstrap
 
@@ -33,6 +31,11 @@ The `onboarding-check.sh` SessionStart hook prompts the user to run `/setup` whe
 Re-running `/setup` on an already-configured fork shows the current config and asks what to update. Use `--reset` to clear everything and start from scratch.
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 > **Tip for the agent driving setup**: `docs/multi-project.md` is the canonical reference for portfolio modes, v1→v2 migration, custom-templates path-mirroring, the FAQ, and trade-offs. As of #372 it is **not** auto-imported into the session context (the 70k-char file was loading ~18k tokens into every session, even for adopters who never re-run setup). The steps below are self-contained for the mechanical setup. If a first-timer asks a question mid-setup that this SKILL doesn't answer directly, `Read docs/multi-project.md` on demand rather than guessing.
 
@@ -63,12 +66,15 @@ The sibling `check-jq-installed.sh` SessionStart hook surfaces the same gap as a
 
 ### Step 0: Mark this session as bootstrap (REQUIRED)
 
-`/setup` runs BEFORE any portfolio is configured, so no project tickets can exist yet. The `require-active-ticket.sh` PreToolUse hook would otherwise block every Edit / Write / Bash-write the skill needs to make. To stay coherent with the ticket-first rule without forcing adopters to file a placeholder ticket against nothing, the skill writes a one-line marker at `.claude/session/active-bootstrap` containing the skill name. The hook reads the marker and exempts skills listed in `ticket.bootstrap_skills` (in `.claude/project-config.defaults.json` — `setup` is on the default list).
+`/setup` runs BEFORE any portfolio is configured, so no project tickets can exist yet. The `require-active-ticket.sh` PreToolUse hook would otherwise block every Edit / Write / Bash-write the skill needs to make. To stay coherent with the ticket-first rule without forcing adopters to file a placeholder ticket against nothing, the skill writes a one-line marker at the path from `active_bootstrap_marker_path` containing the skill name. The hook reads the marker and exempts skills listed in `ticket.bootstrap_skills` (in `.claude/project-config.defaults.json` — `setup` is on the default list).
 
 Run this **before any tool calls that edit files**:
 
 ```bash
-mkdir -p .claude/session && echo "setup" > .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+mkdir -p "$marker_home/.claude/session" && echo "setup" > "$skill_marker"
 ```
 
 The marker is cleared in Step 8 below (and on the next SessionStart by `clear-bootstrap-marker.sh`, in case this skill is interrupted).
@@ -77,13 +83,27 @@ See AgDR-0011 + me2resh/apexyard#150 for the design rationale.
 
 ### Step 0.5: Install the tracked git hooks (REQUIRED)
 
-`core.hooksPath` is a **per-clone** git config value — it lives in `.git/config`, never committed, so every fresh clone of the ops fork starts unset regardless of how many sibling clones already have it configured. Left unset, `.githooks/pre-push` (tracked, but inert without this) never runs on a terminal `git push` — only Claude-Code-driven pushes go through the equivalent `pre-push-gate.sh` PreToolUse hook. Run the installer once per fork, here, so a fresh `/setup` always leaves the clone protected on both paths:
+`core.hooksPath` is a **per-clone** git config value — it lives in `.git/config`, never committed, so every fresh clone of the ops fork starts unset regardless of how many sibling clones already have it configured. Left unset, `.githooks/pre-push` (tracked, but inert without this) never runs — not on a terminal `git push`, and not on a Claude Code-driven one either, since git invokes the same hook the same way regardless of which process ran the push. There is no equivalent Claude Code path anymore: `pre-push-gate.sh` only reminds a session to install this hook when a clone hasn't (#1366, AgDR-0173); it does not run this repo's configured `.pre_push.commands` itself. Run the installer once per fork, here, so a fresh `/setup` always leaves the clone actually protected:
 
 ```bash
 bash bin/install-git-hooks.sh
 ```
 
 Idempotent — a re-run on an already-configured clone reports "no change" and exits 0. If it exits 1 (a real, different `core.hooksPath` the operator configured on purpose), report that plainly and move on without `--force` — overriding a deliberate adopter choice isn't this step's call to make silently. **If it exits 4, treat this as a hard failure of the step, not a warning**: exit 4 means the `git config core.hooksPath` write did not take effect (a stale `.git/config.lock`, a multi-valued key) and the installer is refusing to report success on an unverified write — this clone is **NOT** protected. Show the operator the installer's own error output verbatim and ask them to retry (`bash bin/install-git-hooks.sh`) before continuing `/setup`; do not silently proceed as if the clone were covered. See `bin/install-git-hooks.sh --help` and me2resh/apexyard#1086 for the full state machine (fresh / idempotent / stale-repair / deliberate-third-party / write-failed).
+
+### Step 0.6: Write this clone's rule exclude (REQUIRED)
+
+Ensure the presence-only ops marker exists before resolving a fresh clone without `onboarding.yaml`.
+Run the advisory writer once from the ops fork:
+
+```bash
+[ -f .apexyard-fork ] || touch .apexyard-fork
+bash .claude/hooks/write-rule-excludes.sh
+```
+
+The writer changes only `claudeMdExcludes` in gitignored `.claude/settings.local.json`.
+A warning does not block setup. Restart the session after setup to apply the exclude.
+SessionStart repairs missing or relocated entries. See AgDR-0233.
 
 ### Step 1: Check current state
 
@@ -146,9 +166,35 @@ The full setup lives in `docs/multi-project.md` § "Split-portfolio mode — pub
 
 1. **Confirm the layout**: "Two repos in your account: `your-org/apexyard` (public, this fork) + `your-org/<private-name>` (new private repo for the portfolio). Both clones sit side-by-side on disk. OK?"
 2. **Pick the private repo name**: default suggestion **`your-org/<fork>-portfolio`** (e.g. `your-org/apexyard-portfolio` if you kept the fork name; `your-org/cos-portfolio` if you renamed the fork to `cos`). Compute the `<fork>` part from the public-fork repo name (`gh repo view --json name -q .name`) so the suggestion is correct even when the fork was renamed. Operator confirms or overrides — any name works, the framework only cares about the local path.
-3. **Create the private repo**: `gh repo create your-org/<name> --private --description "..."`. Confirm before running.
-4. **Clone the private repo as a sibling**: `cd .. && gh repo clone your-org/<name>` (no second arg — the clone defaults to a directory named after the repo, so `your-org/apexyard-portfolio` clones into `apexyard-portfolio/`).
-5. **Initialise the portfolio (v2 layout)**: in the private repo, create:
+
+Record `<owner>` and `<name>` when the operator confirms the name. Later checks use that pair. Do not derive `<owner>/<name>` from the remote URL. The reuse path skips item 3 and still uses this pair.
+
+On every run of Step 2b, apply these resume checks in order. Skip a row when its state does not match. Each check is read-only. Record `<fork-root>` before a check that uses `<abs-path>`. [AgDR-0252](../../../docs/agdr/AgDR-0252-portfolio-first-push.md) records the decision. Do not change any hook. The agent never commits on the portfolio repository. The agent never pushes to it.
+
+| State | Check | Action |
+|-------|-------|--------|
+| The chosen repo exists on the forge | `gh repo view <owner>/<name> --json isPrivate,isEmpty` | Stop when `isPrivate` is false. Otherwise ask one `AskUserQuestion`: "Reuse `<owner>/<name>`", "Pick another name", "Stop here". Skip item 3 only on "Reuse". |
+| The repo is not empty, and no sibling clone exists | `isEmpty` is false, and `gh api repos/<owner>/<name>/contents/apexyard.projects.yaml` fails on the default branch | Stop. Report that the repo is not empty and is not a portfolio repo. When the file exists, continue with item 4. |
+| The sibling directory exists | `git -C "<abs-path>" remote get-url origin` names `<owner>/<name>` | Skip item 4. Stop when the directory is not a repo or `origin` names another repo. |
+| HEAD is unborn | `git -C "<abs-path>" rev-parse --verify -q HEAD` fails | Create only the seed files that are missing. Do not overwrite a file. Then apply the stage, print, ask, and verify rules in item 5. |
+| HEAD has a commit | `git -C "<abs-path>" ls-tree -r --name-only HEAD -- apexyard.projects.yaml projects/.gitkeep workspace/.gitkeep onboarding.yaml custom-skills/README.md custom-handbooks/README.md agent-routing.yaml .gitignore` lists all 8 paths | Stop when a path is missing. Report the missing paths. Do not seed on the protected branch. Otherwise apply the next three rows. |
+| HEAD has a commit, and the remote and forge SHAs equal HEAD | The verify commands in item 5 | Skip the commit and the push. Continue with item 6. |
+| HEAD has a commit, and the branch is absent on the remote and the forge | The verify commands in item 5 | Print only the push command. Then ask and verify, as in item 5. |
+| HEAD has a commit, and the remote or forge SHA differs from HEAD | The verify commands in item 5 | Stop. Report both SHAs. Do not offer a force push. |
+
+When `gh repo view` fails because the repo does not exist, continue with item 3. Stop on any other error from that command.
+
+3. **Create the private repo.** Run `gh repo create your-org/<name> --private --description "..."`. Confirm before you run it. Skip this item only when the operator chooses "Reuse `<owner>/<name>`".
+
+Before item 4, run `git rev-parse --show-toplevel` in the ops fork. Record the printed path as `<fork-root>`. A later Bash call does not keep the shell directory from `cd ..`. When `<fork-root>/../<name>` already exists, run `git -C "<fork-root>/../<name>" rev-parse --show-toplevel` before the clone. Record that path as `<abs-path>`. Then apply the sibling-directory row.
+
+4. **Clone the sibling, then record its root.** Clone with `cd .. && gh repo clone your-org/<name>`. Pass no second argument. The clone directory uses the repo name. Example: `your-org/apexyard-portfolio` clones into `apexyard-portfolio/`.
+
+   After the clone, run `git -C "<fork-root>/../<name>" rev-parse --show-toplevel`. Record that path as `<abs-path>`. Use `<fork-root>` and `<abs-path>` as literal text in later commands. On Git for Windows, `rev-parse` prints the `C:/dir` form. Quote that form in every command. That form works in Git Bash, PowerShell, and cmd.
+
+   When the sibling directory already exists, run `git -C "<abs-path>" remote get-url origin`. Skip the clone when `origin` names `<owner>/<name>`. Stop when the directory is not a repo. Stop when `origin` names another repo.
+
+5. **Initialise the portfolio (v2 layout).** Create these files under `<abs-path>`:
    - `apexyard.projects.yaml` with `version: 1`, `projects: []`, `defaults: {status: active, ticket_prefix: GH}`
    - empty `projects/` dir (with a `.gitkeep` so the dir survives the initial commit)
    - empty `workspace/` dir (with a `.gitkeep`) — managed-project clones land here
@@ -157,8 +203,91 @@ The full setup lives in `docs/multi-project.md` § "Split-portfolio mode — pub
    - empty **`custom-handbooks/`** dir + a one-paragraph `custom-handbooks/README.md` explaining the convention. Company-confidential coding standards live as `custom-handbooks/{architecture,general,language/<lang>}/*.md` here, mirroring the public `handbooks/` path-convention. Rex consumes both layers during code review (advisory by default, blocking with `ENFORCEMENT: blocking` at the top of the file). See `handbooks/README.md` for the format. (Added in #243.)
    - **`agent-routing.yaml`** seeded from `<fork>/agent-routing.yaml.example` (the framework's worked-examples file). This is the adopter-routing source-of-truth for split-portfolio mode — every adopter override (per-agent model, endpoint, env, timeout) lives here. The seeded file starts as the framework example so adopters see a working shape; the empty `agents: {}` block at the top means zero overrides until edited. The SessionStart sync hook (`apply-agent-routing.sh`, #357) reads it on every session start. See `docs/multi-project.md` § "Centralised agent routing — `agent-routing.yaml`" for the schema. (Added in #351 PR 3.)
    - `.gitignore` with `workspace/*/` so the inner clones don't get double-tracked in the private repo either
-   - initial commit + push
-6. **Configure path resolution in the fork** (recommended — v2 config-block mode):
+
+   The eight seed paths are `apexyard.projects.yaml`, `projects/.gitkeep`, `workspace/.gitkeep`, `onboarding.yaml`, `custom-skills/README.md`, `custom-handbooks/README.md`, `agent-routing.yaml`, and `.gitignore`.
+
+   **Stage by name.** The agent stages those eight files with one command. Never run `git add -A`. Never run `git add .`. Never run `git add --all`.
+
+   ```bash
+   git -C "<abs-path>" add -- apexyard.projects.yaml projects/.gitkeep workspace/.gitkeep \
+     onboarding.yaml custom-skills/README.md custom-handbooks/README.md agent-routing.yaml .gitignore
+   ```
+
+   Print the staged names with `git -C "<abs-path>" diff --cached --name-only`.
+
+   When `git add` exits 128 and reports `pathspec '<path>' did not match any files`, Git staged nothing. Re-create the missing seed file from the list above. Run the same `git add` command again.
+
+   **Print the operator command. Do not run it.** The commit gate blocks the commit. The push gate blocks the push. Never suggest `--no-verify`. Never add `--no-verify`, `-c`, or a force option to the printed command.
+
+   Substitute the recorded `<abs-path>`. Quote the path. Use the `C:/dir` form from `git rev-parse --show-toplevel`.
+
+   Print the Claude Code form first. The `!` prefix runs outside the agent Bash tool. `&&` runs the push only when the commit succeeds:
+
+   ```text
+   ! git -C "<abs-path>" commit -m "chore: initialise portfolio" && git -C "<abs-path>" push -u origin HEAD
+   ```
+
+   Then print this note: "In any other harness, run these two commands in a terminal. Run the second command only when the first one succeeds."
+
+   Print the plain terminal form next. Use this form in PowerShell, in cmd, and in every harness other than Claude Code:
+
+   ```text
+   git -C "<abs-path>" commit -m "chore: initialise portfolio"
+   git -C "<abs-path>" push -u origin HEAD
+   ```
+
+   Both forms use `push -u origin HEAD`. Do not write a literal branch name. Read the branch later with `git symbolic-ref --short HEAD`. The clone branch depends on the server and on `init.defaultBranch`.
+
+   When the resume row says to print only the push, omit the commit line in both forms. Print `! git -C "<abs-path>" push -u origin HEAD` and `git -C "<abs-path>" push -u origin HEAD`.
+
+   **Ask the operator.** Use one `AskUserQuestion`. Put these options in this order:
+
+   - "Done"
+   - "Commit or push failed (paste the error)"
+   - "Stop here"
+
+   When the harness has no `AskUserQuestion`, ask the same three options as a numbered list.
+
+   On "Stop here", stop. Print: "Run /setup again to continue. Nothing reached the forge." Leave the staged files in place.
+
+   **Verify on "Done".** Use these read-only commands. `<owner>/<name>` is the recorded pair. `BR` comes from `symbolic-ref`, not from a literal `main`.
+
+   ```bash
+   P="<abs-path>"
+   BR=$(git -C "$P" symbolic-ref --short HEAD)
+   LOCAL=$(git -C "$P" rev-parse --verify HEAD)
+   REMOTE=$(git -C "$P" ls-remote origin "refs/heads/$BR" | awk -v r="refs/heads/$BR" '$2 == r { print $1 }')
+   FORGE_ERR=$(mktemp)
+   FORGE=$(gh api "repos/<owner>/<name>/branches/$BR" --jq .commit.sha 2>"$FORGE_ERR") || FORGE=""
+   [ -n "$LOCAL" ] && [ "$LOCAL" = "$REMOTE" ] && [ "$LOCAL" = "$FORGE" ]
+   ```
+
+   The `awk` filter compares the ref name exactly (`$2 == r`). An `ls-remote` pattern can match the tail of another ref. Do not pass `--heads` to `ls-remote`. Do not pass `--branches` to `ls-remote`. `ls-remote` reads the fetch URL. The forge SHA covers a push that `pushurl` or `pushInsteadOf` sends to another URL.
+
+   When `FORGE` is empty, show the contents of `$FORGE_ERR` to the operator. Then remove the temp file (`rm -f "$FORGE_ERR"`). Keep `|| FORGE=""`. An empty `FORGE` never matches `LOCAL`. Map the error text to a forge failure row below.
+
+   When `LOCAL`, `REMOTE`, and `FORGE` match, continue with item 6. When a value differs, apply the failure actions below.
+
+   **Failure actions.**
+
+   | Failure | Action |
+   |---------|--------|
+   | The operator pastes a commit error, for example no git identity | Show the git message. Ask the operator to fix it. Print the command again. |
+   | A git-native hook blocks the commit, through a global `core.hooksPath` | Show the hook message. Ask the operator how to continue. Never suggest `--no-verify`. |
+   | The push fails on authentication | Suggest `gh auth status` and `gh auth setup-git`. Print the push command again. The agent does not run the push. |
+   | The push fails as non-fast-forward | Stop. Do not offer a force push. The remote has commits that `/setup` did not make. |
+   | The operator picks "Done" but did not run the command | HEAD is unborn, or the remote has no branch. Report that result. Print the command again. |
+   | The forge branch is absent (HTTP 404, or "Branch not found") | Show `$FORGE_ERR`. Report that the branch is absent on the forge. Print the push command again. |
+   | The forge check fails on authentication (HTTP 401 or 403, or "auth" in the error) | Show `$FORGE_ERR`. Suggest `gh auth status` and `gh auth login`. Do not treat this as a missing branch. |
+   | The forge check fails on a network or other error | Show `$FORGE_ERR`. Ask the operator to fix the network or the `gh` setup. Do not treat this as a missing branch. |
+   | The push went to another URL, for example through a global `pushurl` or `pushInsteadOf` | `REMOTE` matches `LOCAL`, and the forge error is HTTP 404 or "Branch not found". Stop. Show `git -C "<abs-path>" remote get-url --push --all origin`. Ask the operator to fix the config. |
+   | The operator runs the command in another directory, or edits the path | Report the value that differs. Print the command again. `git -C` uses an absolute path, so the shell directory does not matter. |
+   | The session ends during the pause | The next run applies the resume table. `clear-bootstrap-marker.sh` clears the bootstrap marker at SessionStart. Step 0 writes it again. |
+   | No operator is present | Not supported. Step 2 and item 3 already wait for an answer. |
+
+   After two failed checks in one run, stop. Print: "Run /setup again to continue. Nothing reached the forge."
+
+6. **Configure path resolution in the fork** (recommended — v2 config-block mode). Continue here only when item 5 reports that LOCAL, REMOTE, and FORGE match, or when a resume row skips the commit and the push.
    - Append `.gitignore` lines for `apexyard.projects.yaml`, `projects`, and `onboarding.yaml`. Keep the framework's `workspace/*` + `!workspace/README.md` pair: it ignores every adopter workspace entry while leaving the committed convention README visible and re-includable. Do not add a broad `workspace` rule; Git cannot re-include the README when its parent directory is excluded.
    - Untrack the upstream framework's tracked `projects/README.md` and `onboarding.yaml`: `git rm --cached -r projects onboarding.yaml 2>/dev/null || true`. **Do not untrack `workspace/README.md`** — it is a public framework artefact and stays in the fork per AgDR-0021 § G.
    - Write `.claude/project-config.json` with the v2 `portfolio:` block pointing at the sibling repo. Substitute the actual sibling-dir name the operator chose for `apexyard-portfolio` below:
@@ -471,6 +600,10 @@ Pick the line that matches the actual outcome. Don't claim "enabled" if any of (
 
 ### Step 2d: Harness selection (skippable)
 
+Use `AskUserQuestion` for harness selection. Recommend Claude Code first.
+Preserve multiple selections and split the six options across wizard questions.
+Use the numbered prompt below only when the harness lacks the tool.
+
 Background. As of 2026-07-09 the framework's mechanical gates (merge gate, ticket-first, secrets scanning, red-CI block) reach beyond Claude Code through thin per-harness adapters — see `docs/harnesses/README.md`, the single source of truth for the support matrix. This step surfaces that matrix at onboarding time so a non-Claude-Code adopter doesn't have to discover `docs/harnesses/` on their own. It is deliberately light: Claude Code adopters (the default) answer one question and move on.
 
 Ask:
@@ -507,6 +640,28 @@ Which harness(es) do you run ApexYard with?
 **Don't run the install command yourself.** This step is informational — print the command and the precondition, don't execute `bin/install-*-adapter.sh` on the operator's behalf. They run it when they're ready; onboarding shouldn't silently mutate a harness config the operator hasn't confirmed they want touched.
 
 Record the pick (comma-separated list, or `claude-code` if 1/default) as `$SELECTED_HARNESSES` for the Step 4 summary line.
+
+### Step 2e: Status band (optional, Claude Code only)
+
+Skip this step when `$SELECTED_HARNESSES` does not include `claude-code`.
+
+Use `AskUserQuestion` with one yes/no question. Recommend "n" first. Use this prompt only when the harness lacks the tool:
+
+```
+Show the ApexYard status band above the prompt? (y/n)
+```
+
+- **"n" or empty** → continue to Step 3.
+- **"y"** → run these two commands from the ops-fork root, then continue to Step 3:
+
+  ```bash
+  claude plugin marketplace add ./ --scope local
+  claude plugin install apexyard-status@apexyard --scope local
+  ```
+
+  `local` scope writes only to the uncommitted `.claude/settings.local.json`. Do not enable the plugin in `.claude/settings.json`. If a command fails, print the error and the two commands, then continue. The band is optional.
+
+Record the answer as `$STATUS_BAND` (`on` or `off`) for the Step 4 summary line, for example `Status band: on (local scope)`. See `plugins/apexyard-status/README.md` and AgDR-0227.
 
 ### Step 3: Parse and map to defaults
 
@@ -553,6 +708,7 @@ AgDR gate: ON (default architecture paths)
 Commit types: framework defaults (feat, fix, refactor, test, docs, chore, style, perf, build, ci, revert)
 LSP: enabled (typescript via typescript-language-server, env var in ~/.zshrc, plugin: manual)
 Harness: Claude Code (native — no adapter needed)
+Status band: off
 
 Use these defaults, or customize?
 ```
@@ -698,13 +854,36 @@ Enable it now? (needs admin on the repo)
 
 On **y**, run `gh repo edit <FORK_REPO> --enable-issues` and confirm. On **n**, print the one-liner and move on. Never enable silently — it's an externally-visible repo-settings change requiring admin scope, and the adopter may intend to track elsewhere. (In split-portfolio mode, the issue-hosting repo is the **public fork**, not the private portfolio — probe the fork, which is what `gh repo view` returns here.)
 
+### Step 7c: Record origin public proof for leak-hook exemption (#1477)
+
+The staged and runtime leak hooks stay offline. They exempt origin identity only when local proof names origin itself (AgDR-0190). One proof path is `leak_protection.origin_verified_public` in `.claude/project-config.json`.
+
+Run the helper once while network access is available:
+
+```bash
+bash bin/record-origin-verified-public.sh
+```
+
+The helper:
+
+1. Parses the `origin` remote into an `owner/repo` slug.
+2. Runs `gh repo view <slug> --json visibility,isFork`.
+3. Writes `leak_protection.origin_verified_public` only when visibility is `PUBLIC`.
+4. Removes an earlier key when GitHub reports the repo is not `PUBLIC`, for example after the repo was made private. Prints why the origin exemption is off.
+5. Keeps an earlier matching key when the check itself fails (no `gh`, no network, no auth), and says so. Writes no new key in that case.
+
+Show the helper's stdout to the operator. Do not invent a key by hand. Do not stage `.claude/project-config.json` (gitignored; see #1031). A private ops origin is expected and fine; the exemption simply stays off.
+
 ### Step 8: Clear the bootstrap marker (REQUIRED)
 
 ```bash
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-Always remove the marker on a clean exit so subsequent edits in the same session go through the normal ticket gate. If `/setup` is interrupted before this step, `clear-bootstrap-marker.sh` (SessionStart hook) clears the stale marker on the next session.
+Always remove the marker on a clean exit so subsequent edits in the same session go through the normal ticket gate. If `/setup` is interrupted before this step, `clear-bootstrap-marker.sh` (SessionStart hook) clears the marker when the same session restarts.
 
 ## Rules
 
@@ -713,7 +892,7 @@ Always remove the marker on a clean exit so subsequent edits in the same session
 3. **Stage, don't commit.** The user should see the diff before it's committed. `/setup` stages; the user commits.
 4. **Preserve structure.** `onboarding.yaml` has comments that explain each section. Don't blow them away — edit in place.
 5. **Idempotent.** Running `/setup` again shows current config and asks what to update. Running with `--reset` clears and re-asks. Running with `--enable-lsp` retrofits the LSP step on an already-configured fork; if LSP is already enabled it's a no-op.
-6. **No project-config.json.** `/setup` configures the FRAMEWORK (onboarding.yaml). Per-project config is handled by `/handover` and `/idea` when projects enter the portfolio.
+6. **Project-config is narrow.** `/setup` configures the FRAMEWORK (`onboarding.yaml`). Do not invent broad `.claude/project-config.json` policy by hand. Allowed writes: the split-portfolio `portfolio:` block (Step 2b) and `leak_protection.origin_verified_public` via `bin/record-origin-verified-public.sh` (Step 7c). Per-project config otherwise stays with `/handover` and `/idea`.
 7. **Never auto-install language runtimes.** Step 2c installs LSP servers (e.g. `typescript-language-server`, `pyright`, `gopls`, `rust-analyzer`) but never the underlying runtime (`node`, `python`, `go`, `rustup`). If a runtime is missing, refuse the LSP install gracefully and tell the operator what to install.
 8. **Print plugin-install commands; never invoke them.** The Claude Code plugin marketplace command shape (`/plugin marketplace add`, `/plugin install`, `/reload-plugins`) is empirically stable — Step 2c.5(d) prints a copy-paste block for the operator. But `/plugin` is a Claude Code UI built-in, not a shell command, so the skill never runs the commands itself — it prints them. Always emit the `marketplace add` line; it's idempotent and recovers the case where the docs' auto-load claim doesn't fire on a fresh install.
 9. **`docs/harnesses/README.md` is the single source of truth for harness support.** Step 2d summarises and links it — it never copies the capability matrix inline as a maintained duplicate. When printing a harness's install command / precondition / tier, read the doc fresh rather than trusting a stale table baked into this skill; the matrix changes as adapters move through live-verification. Never round a harness's tier up. Do not restore the retired failClosed-only claim for Cursor.

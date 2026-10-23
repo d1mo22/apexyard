@@ -6,7 +6,7 @@
 #   - builds an isolated sandbox containing onboarding.yaml, an empty
 #     registry, the hook script, the two libs it sources, and the shipped
 #     project-config defaults
-#   - optionally writes a current-ticket marker and/or active-bootstrap
+#   - optionally writes a ticket marker into the sandbox git dir and/or an active-bootstrap
 #     marker to flip the gate
 #   - pipes a synthetic PreToolUse JSON (Edit or Bash tool) to the hook
 #   - asserts exit code (0=pass-through, 2=blocked) and stderr regex
@@ -15,15 +15,27 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+export CLAUDE_CODE_SESSION_ID=marker-test
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/require-active-ticket.sh"
 LIB_BASH="$SRC_ROOT/.claude/hooks/_lib-detect-bash-write.sh"
 LIB_CFG="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
 LIB_PATH_RESOLVE="$SRC_ROOT/.claude/hooks/_lib-path-resolve.sh"
 LIB_ACTIVE_TICKET="$SRC_ROOT/.claude/hooks/_lib-active-ticket.sh"
+LIB_TICKET_PATH_EXEMPT="$SRC_ROOT/.claude/hooks/_lib-ticket-path-exemptions.sh"
+LIB_MASK="$SRC_ROOT/.claude/hooks/_lib-mask-quoted.sh"
 DEFAULTS="$SRC_ROOT/.claude/project-config.defaults.json"
 
-for f in "$HOOK_SRC" "$LIB_BASH" "$LIB_CFG" "$LIB_PATH_RESOLVE" "$LIB_ACTIVE_TICKET" "$DEFAULTS"; do
+# This legacy fixture omits _lib-command-scrub.sh on purpose. It pins the
+# raw-command fallback when a partial install lacks the shared parser. The
+# installed-parser verdicts live in test_command_scrub_regressions.sh.
+
+for f in "$HOOK_SRC" "$LIB_BASH" "$LIB_CFG" "$LIB_PATH_RESOLVE" "$LIB_ACTIVE_TICKET" "$LIB_TICKET_PATH_EXEMPT" "$LIB_MASK" "$DEFAULTS"; do
   if [ ! -f "$f" ]; then
     echo "FAIL: required source missing: $f" >&2
     exit 1
@@ -34,7 +46,7 @@ PASS=0
 FAIL=0
 FAILED_CASES=""
 
-make_sandbox() {
+make_sandbox_template() {
   local sb
   sb=$(mktemp -d)
   (
@@ -50,11 +62,26 @@ make_sandbox() {
   mkdir -p "$sb/.claude/hooks" "$sb/.claude/session"
   cp "$HOOK_SRC" "$sb/.claude/hooks/require-active-ticket.sh"
   cp "$LIB_BASH" "$sb/.claude/hooks/_lib-detect-bash-write.sh"
+  cp "$(dirname "$LIB_BASH")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
   cp "$LIB_CFG"  "$sb/.claude/hooks/_lib-read-config.sh"
+  cp "$(cd "$(dirname "$0")/.." && pwd)/_lib-session-markers.sh" "$sb/.claude/hooks/_lib-session-markers.sh"
   cp "$LIB_PATH_RESOLVE" "$sb/.claude/hooks/_lib-path-resolve.sh"
   cp "$LIB_ACTIVE_TICKET" "$sb/.claude/hooks/_lib-active-ticket.sh"
+  cp "$LIB_TICKET_PATH_EXEMPT" "$sb/.claude/hooks/_lib-ticket-path-exemptions.sh"
+  cp "$LIB_MASK" "$sb/.claude/hooks/_lib-mask-quoted.sh"
   cp "$DEFAULTS" "$sb/.claude/project-config.defaults.json"
   chmod +x "$sb/.claude/hooks/require-active-ticket.sh"
+  echo "$sb"
+}
+
+# Copy a pristine fixture. Each case keeps independent files and Git state.
+FIXTURE_TEMPLATE=$(make_sandbox_template) || exit 1
+trap 'rm -rf "$FIXTURE_TEMPLATE"' EXIT
+
+make_sandbox() {
+  local sb
+  sb=$(mktemp -d) || return 1
+  cp -R "$FIXTURE_TEMPLATE/." "$sb" || return 1
   echo "$sb"
 }
 
@@ -66,26 +93,39 @@ make_sandbox() {
 # "#1089 fail-closed" cases below.
 make_sandbox_no_pathresolve() {
   local sb
-  sb=$(mktemp -d)
-  (
-    cd "$sb" || exit 1
-    git init -q
-    git config user.email "test@example.com"
-    git config user.name "test"
-    : > onboarding.yaml
-    : > apexyard.projects.yaml
-    git add onboarding.yaml apexyard.projects.yaml
-    git commit -q -m "init"
-  )
-  mkdir -p "$sb/.claude/hooks" "$sb/.claude/session"
-  cp "$HOOK_SRC" "$sb/.claude/hooks/require-active-ticket.sh"
-  cp "$LIB_BASH" "$sb/.claude/hooks/_lib-detect-bash-write.sh"
-  cp "$LIB_CFG"  "$sb/.claude/hooks/_lib-read-config.sh"
-  cp "$LIB_ACTIVE_TICKET" "$sb/.claude/hooks/_lib-active-ticket.sh"
-  # NOTE: _lib-path-resolve.sh intentionally NOT copied here.
-  cp "$DEFAULTS" "$sb/.claude/project-config.defaults.json"
-  chmod +x "$sb/.claude/hooks/require-active-ticket.sh"
+  sb=$(make_sandbox) || return 1
+  rm -f "$sb/.claude/hooks/_lib-path-resolve.sh"
   echo "$sb"
+}
+
+# Register a managed project as a real git clone under workspace/ and list it
+# in the sandbox registry.
+add_project() {
+  local sb="$1" name="$2"
+  mkdir -p "$sb/workspace"
+  git init -q "$sb/workspace/$name"
+  git -C "$sb/workspace/$name" config user.email "test@example.com"
+  git -C "$sb/workspace/$name" config user.name "test"
+  git -C "$sb/workspace/$name" commit -q --allow-empty -m init
+  printf 'projects:\n  - name: %s\n    repo: me2resh/%s\n' "$name" "$name" > "$sb/apexyard.projects.yaml"
+  # The registry path comes from the portfolio libraries. Only the cases that
+  # need a registered project pay for them.
+  cp "$SRC_ROOT/.claude/hooks/_lib-portfolio-paths.sh" "$SRC_ROOT/.claude/hooks/_lib-ops-root.sh" \
+     "$SRC_ROOT/.claude/hooks/_lib-resolution-cache.sh" "$sb/.claude/hooks/"
+}
+
+# Write a ticket marker into the git dir of the working tree at <dir>. The
+# marker names the repo of the tree it lands in, as the writer requires: a
+# clone of workspace/<name> gets me2resh/<name>, and the ops fork gets
+# me2resh/apexyard.
+write_marker() {
+  local dir="$1" gd cd repo="me2resh/apexyard" n
+  gd=$(git -C "$dir" rev-parse --absolute-git-dir)
+  cd=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)
+  case "$cd" in
+    */workspace/*/.git) n="${cd%/.git}"; repo="me2resh/${n##*/}" ;;
+  esac
+  printf 'repo=%s\nnumber=%s\ntitle=test\n' "$repo" "${2:-1}" > "$gd/apexyard-ticket"
 }
 
 run_case() {
@@ -146,42 +186,42 @@ run_case "edit blocked w/o ticket no bootstrap" 2 "BLOCKED" "$in" "$sb"
 
 # 7. Edit .gitignore, no ticket, BOOTSTRAP marker (setup) → allowed
 sb=$(make_sandbox)
-echo "setup" > "$sb/.claude/session/active-bootstrap"
+echo "setup" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg p "$sb/.gitignore" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "edit allowed with setup bootstrap marker" 0 "" "$in" "$sb"
 
 # 8. Edit src/foo.ts, no ticket, BOOTSTRAP marker (handover) → allowed
 sb=$(make_sandbox)
-echo "handover" > "$sb/.claude/session/active-bootstrap"
+echo "handover" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg p "$sb/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "edit allowed with handover bootstrap marker" 0 "" "$in" "$sb"
 
 # 9. Edit src/foo.ts, no ticket, BOOTSTRAP marker (UNKNOWN skill) → BLOCKED
 #    (only skills on the configured bootstrap_skills list are exempt)
 sb=$(make_sandbox)
-echo "some-random-skill" > "$sb/.claude/session/active-bootstrap"
+echo "some-random-skill" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg p "$sb/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "edit blocked when bootstrap marker is for non-listed skill" 2 "BLOCKED" "$in" "$sb"
 
 # 10. Bash python write to .gitignore, BOOTSTRAP marker (setup) → allowed
 #     (this is the exact /setup-runs-into-#151-bypass scenario from #150)
 sb=$(make_sandbox)
-echo "setup" > "$sb/.claude/session/active-bootstrap"
+echo "setup" > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg c 'python3 -c "import pathlib; pathlib.Path(\".gitignore\").write_text(\"x\")"' \
   '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash write allowed with setup bootstrap" 0 "" "$in" "$sb"
 
 # 11. Empty bootstrap marker → no exemption (treated as no marker)
 sb=$(make_sandbox)
-: > "$sb/.claude/session/active-bootstrap"
+: > "$sb/.claude/session/active-bootstrap.marker-test"
 in=$(jq -nc --arg p "$sb/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "edit blocked when bootstrap marker is empty" 2 "BLOCKED" "$in" "$sb"
 
 # --- Active-ticket marker still works (regression for the legacy path) -
 
-# 12. Edit src/foo.ts with a current-ticket marker → allowed
+# 12. Edit src/foo.ts with a marker in the ops fork git dir → allowed
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=999
 title=test
@@ -190,85 +230,80 @@ EOF
 in=$(jq -nc --arg p "$sb/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "edit allowed with active ticket marker" 0 "" "$in" "$sb"
 
-# --- Per-worktree marker tier (#513) -----------------------------------
+# --- Per-tree markers in the git dir -----------------------------------
 
-# NOTE: PROJECT resolution compares FILE_PATH against the hook's resolved
-# OPS_ROOT (from `git rev-parse`, which canonicalises symlinks). On macOS
-# mktemp returns a /var/... path that git reports as /private/var/..., so the
-# file_path must use the realpath of the sandbox or the workspace prefix won't
-# match. rsb = canonical sandbox path.
+# NOTE: the sandbox path must be physical (rsb) so the file_path matches the
+# path the library resolves on macOS, where mktemp returns /var/... and git
+# reports /private/var/...
 
-# 13. per-worktree marker present + matching branch → allowed
+# 13. a linked worktree of a registered project holds its own marker → allowed
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
-mkdir -p "$sb/.claude/session/tickets/myproj"
-cat > "$sb/.claude/session/tickets/myproj/feature__x" <<EOF
-repo=me2resh/apexyard
-number=513
-title=worktree A
-EOF
-in=$(jq -nc --arg p "$rsb/workspace/myproj/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-export CLAUDE_WORKTREE_BRANCH="feature/x"
-run_case "per-worktree marker honored on matching branch" 0 "" "$in" "$sb"
-unset CLAUDE_WORKTREE_BRANCH
+add_project "$sb" myproj
+git -C "$sb/workspace/myproj" worktree add -q "$rsb/wt-x" -b feature/x
+write_marker "$rsb/wt-x" 513
+in=$(jq -nc --arg p "$rsb/wt-x/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
+run_case "linked worktree marker honored" 0 "" "$in" "$sb"
 
-# 14. per-worktree isolation: marker exists for branch A, agent on branch B,
-#     no per-project file, no current-ticket → BLOCKED (proves no collision)
+# 14. isolation: worktree A has a marker, worktree B has none → B is BLOCKED
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
-mkdir -p "$sb/.claude/session/tickets/myproj"
-cat > "$sb/.claude/session/tickets/myproj/feature__a" <<EOF
-repo=me2resh/apexyard
-number=513
-title=worktree A
-EOF
-in=$(jq -nc --arg p "$rsb/workspace/myproj/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-export CLAUDE_WORKTREE_BRANCH="feature/b"
-run_case "per-worktree isolation: branch B not satisfied by branch A marker" 2 "BLOCKED" "$in" "$sb"
-unset CLAUDE_WORKTREE_BRANCH
+add_project "$sb" myproj
+git -C "$sb/workspace/myproj" worktree add -q "$rsb/wt-a" -b feature/a
+git -C "$sb/workspace/myproj" worktree add -q "$rsb/wt-b" -b feature/b
+write_marker "$rsb/wt-a" 513
+in=$(jq -nc --arg p "$rsb/wt-b/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
+run_case "worktree isolation: worktree B not satisfied by worktree A marker" 2 "BLOCKED" "$in" "$sb"
 
-# 15. per-project FILE marker still works under a workspace path with no
-#     worktree branch detected (single-agent regression)
+# 14b. the main clone of the same project does not see a worktree's marker
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
-mkdir -p "$sb/.claude/session/tickets"
-cat > "$sb/.claude/session/tickets/myproj" <<EOF
-repo=me2resh/apexyard
-number=513
-title=single agent
-EOF
+add_project "$sb" myproj
+git -C "$sb/workspace/myproj" worktree add -q "$rsb/wt-a" -b feature/a
+write_marker "$rsb/wt-a" 513
 in=$(jq -nc --arg p "$rsb/workspace/myproj/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-run_case "per-project file marker still works (no worktree)" 0 "" "$in" "$sb"
+run_case "main clone not satisfied by a worktree marker" 2 "BLOCKED" "$in" "$sb"
 
-# 16. git linked-worktree detection (NO env var): a real linked worktree at
-#     workspace/myproj on branch wt-x is detected via absolute git-dir vs
-#     common-dir, tier-0 marker honored. Exercises the write/read-symmetric
-#     detection path, not just the CLAUDE_WORKTREE_BRANCH shortcut.
+# 15. the main clone holds its own marker → allowed
+sb=$(make_sandbox)
+rsb=$(cd "$sb" && pwd -P)
+add_project "$sb" myproj
+write_marker "$rsb/workspace/myproj" 513
+in=$(jq -nc --arg p "$rsb/workspace/myproj/src/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
+run_case "main clone marker honored" 0 "" "$in" "$sb"
+
+# 16. a linked worktree of the ops fork itself, placed at workspace/myproj,
+#     holds its own marker → allowed
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
 ( cd "$sb" && git worktree add -q workspace/myproj -b wt-x >/dev/null 2>&1 )
-mkdir -p "$sb/.claude/session/tickets/myproj"
-cat > "$sb/.claude/session/tickets/myproj/wt-x" <<EOF
-repo=me2resh/apexyard
-number=513
-title=worktree via git detection
-EOF
+write_marker "$rsb/workspace/myproj" 513
 in=$(jq -nc --arg p "$rsb/workspace/myproj/foo.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-run_case "per-worktree via git linked-worktree detection (no env var)" 0 "" "$in" "$sb"
+run_case "ops-fork linked worktree marker honored" 0 "" "$in" "$sb"
 
 # --- #569: bash-write path-exemption fixes ------------------------------
 # These cases prove the over-blocking described in #569 is gone, while
 # preserving the gate for writes into tracked source paths.
 
-# 17. cat > /tmp/x with no ticket → allowed (absolute path outside repo)
+# 17. cat > /tmp/x with no ticket → allowed outside repo, including on macOS
+#     where /tmp is a system symlink.
 sb=$(make_sandbox)
+physical_tmp=$(cd /tmp && pwd -P)
 in=$(jq -nc --arg c "cat > /tmp/commit-msg.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash redirect to /tmp exempt (no ticket needed)" 0 "" "$in" "$sb"
-
-# 18. echo > /var/tmp/scratch with no ticket → allowed (non-repo absolute path)
 sb=$(make_sandbox)
+in=$(jq -nc --arg c "cat > $physical_tmp/commit-msg.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "bash redirect to physical /tmp exempt" 0 "" "$in" "$sb"
+
+# 18. echo > /var/tmp/scratch with no ticket → allowed on systems where
+#     /var is a symlink, and with the physical spelling of that path.
+sb=$(make_sandbox)
+physical_var_tmp=$(cd /var/tmp && pwd -P)
 in=$(jq -nc --arg c "echo hello > /var/tmp/scratch.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash redirect to /var/tmp exempt" 0 "" "$in" "$sb"
+sb=$(make_sandbox)
+in=$(jq -nc --arg c "echo hello > $physical_var_tmp/scratch.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "bash redirect to physical /var/tmp exempt" 0 "" "$in" "$sb"
 
 # 19. echo > .claude/session/foo with no ticket → allowed (exempt .claude/ path)
 sb=$(make_sandbox)
@@ -322,9 +357,9 @@ sb=$(make_sandbox)
 in=$(jq -nc --arg c 'cat > "${marker}"' '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash redirect to bare \${marker} exempt" 0 "" "$in" "$sb"
 
-# 26. All #569 cases pass through when a current-ticket marker IS present (regression)
+# 26. All #569 cases pass through when a ticket marker IS present (regression)
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=569
 title=test
@@ -376,13 +411,9 @@ run_case_cwd() {
 #     by walking up from the workspace dir, and the marker is found → exit 0.
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
+add_project "$sb" myproj
 mkdir -p "$sb/workspace/myproj/src"
-mkdir -p "$sb/.claude/session/tickets"
-cat > "$sb/.claude/session/tickets/myproj" <<EOF
-repo=me2resh/myproj
-number=744
-title=anchor fix test
-EOF
+write_marker "$rsb/workspace/myproj" 744
 in=$(jq -nc --arg p "$rsb/workspace/myproj/src/x.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case_cwd "#744 core: file in workspace, valid marker, CWD=/tmp → exempt" 0 "" "$in" "$sb" "/tmp"
 
@@ -437,9 +468,12 @@ _t30_ws_real=$(cd "$_t30_ws" && pwd -P)
 mkdir -p "$_t30_ops/.claude/hooks"
 cp "$HOOK_SRC"  "$_t30_ops/.claude/hooks/require-active-ticket.sh"
 cp "$LIB_BASH"  "$_t30_ops/.claude/hooks/_lib-detect-bash-write.sh"
+cp "$(dirname "$LIB_BASH")/_lib-awk-fallback.sh" "$_t30_ops/.claude/hooks/_lib-awk-fallback.sh"
 cp "$LIB_CFG"   "$_t30_ops/.claude/hooks/_lib-read-config.sh"
+cp "$(cd "$(dirname "$0")/.." && pwd)/_lib-session-markers.sh" "$_t30_ops/.claude/hooks/_lib-session-markers.sh"
 cp "$LIB_PATH_RESOLVE" "$_t30_ops/.claude/hooks/_lib-path-resolve.sh"
 cp "$LIB_ACTIVE_TICKET" "$_t30_ops/.claude/hooks/_lib-active-ticket.sh"
+cp "$LIB_TICKET_PATH_EXEMPT" "$_t30_ops/.claude/hooks/_lib-ticket-path-exemptions.sh"
 cp "$DEFAULTS"  "$_t30_ops/.claude/project-config.defaults.json"
 [ -f "$LIB_OPS_SRC" ]  && cp "$LIB_OPS_SRC"  "$_t30_ops/.claude/hooks/_lib-ops-root.sh"
 [ -f "$LIB_PORT_SRC" ] && cp "$LIB_PORT_SRC" "$_t30_ops/.claude/hooks/_lib-portfolio-paths.sh"
@@ -455,16 +489,15 @@ cat > "$_t30_ops/.claude/project-config.json" <<EOF
 }
 EOF
 
-# Per-project marker in ops fork
-mkdir -p "$_t30_ops/.claude/session/tickets"
-cat > "$_t30_ops/.claude/session/tickets/myproj" <<EOF
-repo=me2resh/myproj
-number=745
-title=split-portfolio anchor fix
-EOF
-
-# Project dir in sibling workspace
+# The project is a real clone in the sibling workspace, registered in the ops
+# fork, with its marker in its own git dir.
 mkdir -p "$_t30_ws/myproj/src"
+git init -q "$_t30_ws/myproj"
+git -C "$_t30_ws/myproj" config user.email "test@example.com"
+git -C "$_t30_ws/myproj" config user.name "test"
+git -C "$_t30_ws/myproj" commit -q --allow-empty -m init
+printf 'projects:\n  - name: myproj\n    repo: me2resh/myproj\n' > "$_t30_ops/apexyard.projects.yaml"
+printf 'repo=me2resh/myproj\nnumber=745\ntitle=split-portfolio anchor fix\n' > "$_t30_ws/myproj/.git/apexyard-ticket"
 
 # Write a session pin so resolve_ops_root finds ops_fork from CWD=/tmp.
 # Use a HERMETIC temp pin dir (not the real $HOME/.claude/apexyard) so the test
@@ -513,6 +546,7 @@ fi
 #     #883 repro.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg p "$home_sim/.zshrc" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "#883 Edit-tool write to out-of-repo dotfile exempt (no ticket)" 0 "" "$in" "$sb"
 rm -rf "$home_sim"
@@ -520,6 +554,7 @@ rm -rf "$home_sim"
 # 32. Same but MultiEdit tool shape (file_path key) → EXEMPT.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg p "$home_sim/.bashrc" '{tool_name:"MultiEdit", tool_input:{file_path:$p}}')
 run_case "#883 MultiEdit-tool write to out-of-repo dotfile exempt" 0 "" "$in" "$sb"
 rm -rf "$home_sim"
@@ -532,6 +567,7 @@ rm -rf "$home_sim"
 #     resolvable.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg c "echo 'export X=1' >> .zshrc" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case_cwd "#883 bash relative write from out-of-repo CWD exempt" 0 "" "$in" "$sb" "$home_sim"
 rm -rf "$home_sim"
@@ -557,13 +593,13 @@ in=$(jq -nc --arg p "$home_sim/link-into-repo/src/app.ts" '{tool_name:"Edit", to
 run_case "#883 symlink into governed repo does NOT bypass gate" 2 "BLOCKED" "$in" "$sb"
 rm -rf "$home_sim"
 
-# 36. Symlink case WITH an active ticket → allowed (proves the symlink IS
-#     correctly resolved to governed content, and the normal ticket-gate
-#     logic — not the out-of-governance exemption — is what applies).
+# 36. Symlink case WITH an active ticket is still refused: the gate refuses a
+#     symlink in the path between the target and the tree root, whatever
+#     ticket exists. The block message names the link.
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
 mkdir -p "$sb/src"
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=883
 title=symlink test
@@ -571,7 +607,7 @@ EOF
 home_sim=$(mktemp -d)
 ln -s "$rsb" "$home_sim/link-into-repo"
 in=$(jq -nc --arg p "$home_sim/link-into-repo/src/app.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-run_case "#883 symlink into governed repo allowed WITH active ticket" 0 "" "$in" "$sb"
+run_case "#883 symlink into governed repo refused even WITH active ticket" 2 "symlink in marker path" "$in" "$sb"
 rm -rf "$home_sim"
 
 # 37. Workspace-project write (governed, even without its own .git) still
@@ -619,23 +655,21 @@ run_case "#885 symlinked-out non-git workspace project still blocked w/o ticket"
 rm -rf "$external"
 
 # 40. Same symlinked-out workspace project, WITH an active ticket marker
-#     → ALLOWED. Keeps the existing "symlink governed content works with
-#     a ticket" behaviour coherent: the raw-containment check correctly
-#     routes this through the normal ticket-gate logic (not the
-#     out-of-governance exemption), and the ticket marker satisfies it.
+#     -> still BLOCKED. A symlinked workspace entry is not a registered clone,
+#     so no marker is read for it.
 sb=$(make_sandbox)
 rsb=$(cd "$sb" && pwd -P)
 mkdir -p "$sb/workspace"
 external=$(mktemp -d)
 mkdir -p "$external/src"
 ln -s "$external" "$sb/workspace/proj"
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=885
 title=symlinked-out workspace project test
 EOF
 in=$(jq -nc --arg p "$rsb/workspace/proj/src/x.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-run_case "#885 symlinked-out non-git workspace project allowed WITH active ticket" 0 "" "$in" "$sb"
+run_case "#885 symlinked-out non-git workspace project blocked even WITH active ticket" 2 "BLOCKED" "$in" "$sb"
 rm -rf "$external"
 
 # --- #886: judge ALL bash write targets, not just the first ------------
@@ -655,7 +689,7 @@ run_case "#886 multi-target (out-of-repo then in-repo) blocked w/o ticket" 2 "BL
 # 42. Same multi-target command, WITH an active ticket → ALLOWED (every
 #     target independently clears the gate).
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=multi-target bash write test
@@ -668,7 +702,7 @@ run_case "#886 multi-target (out-of-repo then in-repo) allowed WITH ticket" 0 ""
 #     exempt — the per-target loop must not become stricter than before
 #     for the plain single-target case.
 sb=$(make_sandbox)
-in=$(jq -nc --arg c "echo a > /tmp/x" '{tool_name:"Bash", tool_input:{command:$c}}')
+in=$(jq -nc --arg c "echo a > $physical_tmp/x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#886 regression: single out-of-repo target still exempt" 0 "" "$in" "$sb"
 
 # 44. Regression: a SINGLE in-repo target (no other target) remains gated
@@ -701,7 +735,7 @@ run_case "#886 no-space ';' then redirect blocked w/o ticket" 2 "BLOCKED" "$in" 
 
 # 47. Same command, WITH an active ticket → ALLOWED (both targets clear).
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=no-space redirection bypass test
@@ -745,7 +779,7 @@ run_case "#886 '&>' redirect-both-streams blocked w/o ticket" 2 "BLOCKED" "$in" 
 
 # 53. Same command, WITH an active ticket → ALLOWED.
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=redirect-both-streams operator test
@@ -768,7 +802,7 @@ run_case "#886 '>|' force-clobber blocked w/o ticket" 2 "BLOCKED" "$in" "$sb"
 
 # 56. Same command, WITH an active ticket → ALLOWED (both targets clear).
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=force-clobber operator test
@@ -806,6 +840,69 @@ sb=$(make_sandbox)
 in=$(jq -nc --arg c "cat < src/app.ts" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#886 sanity: plain '<' read is not gated" 0 "" "$in" "$sb"
 
+# --- #1414: `>&word`, grouped/long sed -i, and sed `w` -----------------
+#
+# Each write below exited 0 with no ticket on dev at 5be9ecb, and wrote
+# the file. The fix must block each one without a ticket and allow it
+# with one. The fd copy and the sed reads must stay ungated.
+
+for c in "echo x >&src/app.ts" "echo x >& src/app.ts" \
+         "sed -n 'w src/app.ts' in.txt" "sed 's/a/b/w src/app.ts' in.txt" \
+         "sed -n 'p;w src/app.ts' in.txt" "sed -Ei 's/a/b/' src/app.ts" \
+         "sed --in-place 's/a/b/' src/app.ts"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+
+  sb=$(make_sandbox)
+  cat > "$sb/.git/apexyard-ticket" <<EOF
+repo=me2resh/apexyard
+number=1414
+title=detector misses test
+EOF
+  run_case "#1414 allowed WITH ticket: $c" 0 "" "$in" "$sb"
+done
+
+for c in "echo x >&2" "sed -n '/warning/p' src/app.ts" "sed 's/w/x/' src/app.ts" \
+         'out=$(npm test 2>&1)' 'bash -c "npm test 2>&1"' \
+         "find . -name '*.md' -exec sed -n 1p {} + -print"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sanity: read stays ungated: $c" 0 "" "$in" "$sb"
+done
+
+# A sed -i edit whose file operand is not extracted must still block when
+# the same command names an exempt sed `w` file. Each of these edits
+# src/app.ts. The first three blocked before #1414, and a first draft of
+# the fix let them pass.
+for c in 'sed -i "s/foo/bar/w /dev/stdout" src/app.ts' \
+         "sed -i 's/a/b/;w /tmp/x' src/app.ts" \
+         'sed -n "w /tmp/x" in.txt && sed -i "s/a/b/" src/app.ts' \
+         'sed --in-place "s/a/b/w /dev/stderr" src/app.ts'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sed -i beside an exempt w file blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+done
+
+# The same holds for other families with no extractable target. Each of
+# these blocks on dev, and a round-2 draft let them pass.
+for c in "awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt" \
+         "python3 -c \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt" \
+         "tar -xf a.tar; sed -n 'w /tmp/x' in.txt" \
+         "go run ./gen && sed -n 's/x/y/w /dev/stdout' out.txt"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 w decoy beside an unextracted write blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+done
+
+# rm alone is exempt, and a `w` to physical /tmp beside it stays exempt. An escaped
+# quote after an fd copy stays a read.
+for c in "rm -f old.ts; sed -n 'w $physical_tmp/x' in.txt" 'bash -c "sh -c \"make 2>&1\""'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sanity: stays ungated: $c" 0 "" "$in" "$sb"
+done
+
 # --- #886/#926 round 4: ZERO whitespace between operator and target -----
 #
 # Hakim's fourth adversarial re-hunt: the mandatory `[[:space:]]+` after
@@ -820,7 +917,7 @@ run_case "#886 no-space '>' (Hakim repro) blocked w/o ticket" 2 "BLOCKED" "$in" 
 
 # 62. Same command, WITH an active ticket → ALLOWED.
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=no-whitespace redirect operator test
@@ -882,7 +979,7 @@ run_case "#886 '||>' after false blocked w/o ticket" 2 "BLOCKED" "$in" "$sb"
 
 # 70. Same command, WITH an active ticket → ALLOWED.
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=886
 title=pipe-adjacent redirect operator test
@@ -923,6 +1020,148 @@ sb=$(make_sandbox)
 in=$(jq -nc --arg c "false || echo err >&2" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#886 sanity: '||' then '>&2' fd-dup is not gated" 0 "" "$in" "$sb"
 
+# --- Quoted-origin diagnostic (#1356) ----------------------------------
+#
+# The gate verdict does NOT change. A read-only command whose only `>` sits
+# inside a quoted argument still blocks in this parser-missing fixture. The
+# diagnostic note explains the conservative fallback. The installed parser
+# allows these read-only commands; test_command_scrub_regressions.sh pins it.
+#
+# This section sits before the #1089 section on purpose. Other open PRs append
+# their cases at the end of the file, and a separate spot keeps merges clean.
+
+NOTE_RE="NOTE: the detector found this match only inside quoted text"
+
+# Runs the hook with no ticket. Asserts exit 2, then asserts that the origin
+# note is present ("note") or absent ("no-note").
+quoted_note_case() {
+  local label="$1" want="$2" input="$3" sb got rc
+  sb=$(make_sandbox)
+  got=$(cd "$sb" && echo "$input" | bash .claude/hooks/require-active-ticket.sh 2>&1 >/dev/null)
+  rc=$?
+  rm -rf "$sb"
+  if [ "$rc" != 2 ]; then
+    echo "FAIL [$label]: want rc=2, got $rc" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "; return
+  fi
+  # "note" requires the current wording. "no-note" rejects ANY note line, so
+  # an older wording cannot pass a no-note case by accident.
+  if { [ "$want" = note ] && echo "$got" | grep -qE "$NOTE_RE"; } \
+     || { [ "$want" = no-note ] && echo "$got" | grep -qE '^NOTE:'; }; then
+    [ "$want" = note ] && { echo "PASS [$label]"; PASS=$((PASS+1)); return; }
+    echo "FAIL [$label]: note was present" >&2
+  else
+    [ "$want" = no-note ] && { echo "PASS [$label]"; PASS=$((PASS+1)); return; }
+    echo "FAIL [$label]: note was absent" >&2
+  fi
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+}
+
+bash_input() { jq -nc --arg c "$1" '{tool_name:"Bash", tool_input:{command:$c}}'; }
+
+# A. Parser-missing fallback: each quoted redirect still blocks and carries
+# the diagnostic note, including the case with no extractable target.
+quoted_note_case "#1356 current behaviour: grep -E '^>' blocks, with the note" \
+  note "$(bash_input "grep -E '^>' f")"
+quoted_note_case "#1356 current behaviour: grep -E 'a>b' blocks, with the note" \
+  note "$(bash_input "grep -E 'a>b' f")"
+quoted_note_case "#1356 current behaviour: awk '\$1 > 0' blocks, with the note" \
+  note "$(bash_input "awk '\$1 > 0' f")"
+quoted_note_case "#1356 current behaviour: git log --format blocks, with the note" \
+  note "$(bash_input "git log --format='%h > %s'")"
+
+# B. Genuine writes carry no note. A note would mislead.
+quoted_note_case "#1356 genuine write carries no origin note" \
+  no-note "$(bash_input "echo hello > notes.txt")"
+quoted_note_case "#1356 quoted target is a real write, no note" \
+  no-note "$(bash_input 'echo hello > "src/app.ts"')"
+
+# C. A quoted `>` before a real write outside quotes. The security review
+# found that the note used to fire here, because the first target came from
+# the quotes. A write sign the detector found outside quotes now suppresses
+# the note.
+quoted_note_case "#1356 quoted '>' then a real redirect, no note" \
+  no-note "$(bash_input "echo 'a>b' > src/app.ts")"
+quoted_note_case "#1356 git log --format then a real redirect, no note" \
+  no-note "$(bash_input "git log --format='%h > %s' > src/app.ts")"
+
+# D. Shapes where the scanner disagreed with bash. Each one really writes
+# src/app.ts. Earlier versions of the helper printed the note for each.
+q="'"
+quoted_note_case "#1356 comment after ';' around a real write, no note" \
+  no-note "$(bash_input "echo hi;# don${q}t
+echo x > src/app.ts;# it${q}s fine")"
+quoted_note_case "#1356 redirect inside \"\$( )\", no note" \
+  no-note "$(bash_input 'x="$(echo hi > src/app.ts)"')"
+quoted_note_case "#1356 \$'...' with an escaped quote, no note" \
+  no-note "$(bash_input "echo \$'\\'' > src/app.ts \\'")"
+quoted_note_case "#1356 single quotes inside a double-quoted \${x#word}, no note" \
+  no-note "$(bash_input "echo \"\${x#'\"'}\" > src/app.ts \\'")"
+quoted_note_case "#1356 bash 5.3 \${ cmd; } inside double quotes, no note" \
+  no-note "$(bash_input 'x="${ echo hi > src/app.ts; }"')"
+
+# E. Quoted text that another program runs. No quote parser can tell this
+# from data, so the note still prints here. It must state both readings and
+# offer no advice to reword the command.
+sb=$(make_sandbox)
+got=$(cd "$sb" && bash_input "bash -c 'echo x > src/app.ts'" \
+  | bash .claude/hooks/require-active-ticket.sh 2>&1 >/dev/null)
+rm -rf "$sb"
+if echo "$got" | grep -qE "$NOTE_RE" \
+   && echo "$got" | grep -q "this match is a false positive" \
+   && echo "$got" | grep -q "it may write a file" \
+   && echo "$got" | grep -q "does not see every kind of write" \
+   && ! echo "$got" | grep -qi "reword"; then
+  echo "PASS [#1356 bash -c: the note states both readings, no reword advice]"; PASS=$((PASS+1))
+else
+  echo "FAIL [#1356 bash -c: the note states both readings, no reword advice]" >&2
+  printf '%s\n' "$got" | sed 's/^/    |/' >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}#1356-both-readings "
+fi
+
+# F. Oversize genuine write. The helper passes the command through the
+# environment. Linux caps one environment string at MAX_ARG_STRLEN, 128 KiB.
+# A larger command makes execve fail with E2BIG, and the mask comes back
+# empty. The hint must treat
+# that as "no answer", not as "differs from the raw command". The input is
+# built with printf, a builtin, because jq --arg would hit the same limit.
+xs=$(head -c 140000 /dev/zero | tr '\0' 'x')
+quoted_note_case "#1356 oversize genuine write (140 KB) carries no origin note" \
+  no-note "$(printf '{"tool_name":"Bash","tool_input":{"command":"echo %s > src/app.ts"}}' "$xs")"
+
+# G. Layout. The note sits between the Target line and "Exempt paths", with a
+# blank line on each side. With no note, one blank line separates the two.
+target_block() { awk '/^Target: /{f=1} f{print} /^Exempt paths/{exit}'; }
+
+sb=$(make_sandbox)
+got=$(cd "$sb" && bash_input "git log --format='%h > %s'" \
+  | bash .claude/hooks/require-active-ticket.sh 2>&1 >/dev/null | target_block)
+rm -rf "$sb"
+n=$(printf '%s\n' "$got" | wc -l)
+if [ -z "$(printf '%s\n' "$got" | sed -n 2p)" ] \
+   && printf '%s\n' "$got" | sed -n 3p | grep -qE "^$NOTE_RE" \
+   && [ -z "$(printf '%s\n' "$got" | sed -n "$((n-1))p")" ] \
+   && printf '%s\n' "$got" | sed -n "${n}p" | grep -q '^Exempt paths'; then
+  echo "PASS [#1356 note has a blank line on each side]"; PASS=$((PASS+1))
+else
+  echo "FAIL [#1356 note has a blank line on each side]: got:" >&2
+  printf '%s\n' "$got" | sed 's/^/    |/' >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}#1356-note-layout "
+fi
+
+sb=$(make_sandbox)
+got=$(cd "$sb" && bash_input "echo hello > notes.txt" \
+  | bash .claude/hooks/require-active-ticket.sh 2>&1 >/dev/null | target_block)
+rm -rf "$sb"
+want=$(printf 'Target: notes.txt\n\nExempt paths (no ticket required): .claude/, docs/, projects/*/docs/, *.md')
+if [ "$got" = "$want" ]; then
+  echo "PASS [#1356 no note keeps the original layout]"; PASS=$((PASS+1))
+else
+  echo "FAIL [#1356 no note keeps the original layout]: got:" >&2
+  printf '%s\n' "$got" | sed 's/^/    |/' >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}#1356-no-note-layout "
+fi
+
 # --- #1089 fail-closed degraded mode (closing #1087's LOW-2) -----------
 #
 # Mirror of cases 31/35 above (the out-of-governance exemption, #883), but
@@ -950,19 +1189,26 @@ in=$(jq -nc --arg p "$home_sim/.zshrc" '{tool_name:"Edit", tool_input:{file_path
 run_case "#1089 fail-closed: out-of-repo dotfile GATED when lib missing" 2 "BLOCKED" "$in" "$sb"
 rm -rf "$home_sim"
 
-# 77. Same scenario, WITH an active ticket marker present → the ordinary
-#     ticket-gate path still passes (proves the degrade only removes the
-#     EXEMPTION, not the hook's ability to function once a ticket exists).
+# 77. Same lib-missing sandbox, WITH an active ticket marker present, and a
+#     target inside the ops fork -> the ordinary ticket-gate path still
+#     passes (proves the degrade only removes the EXEMPTION, not the hook's
+#     ability to function once a ticket exists). An out-of-tree target stays
+#     blocked, because no ticket can authorise a path outside a registered tree.
 sb=$(make_sandbox_no_pathresolve)
+rsb=$(cd "$sb" && pwd -P)
 home_sim=$(mktemp -d)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=1089
 title=test
 url=https://example.com
 EOF
+sb2=$(make_sandbox_no_pathresolve)
+cp "$sb/.git/apexyard-ticket" "$sb2/.git/apexyard-ticket"
+in=$(jq -nc --arg p "$rsb/src/app.ts" '{tool_name:"Edit", tool_input:{file_path:$p}}')
+run_case "#1089 fail-closed: in-repo target ALLOWED with an active ticket, lib still missing" 0 "" "$in" "$sb"
 in=$(jq -nc --arg p "$home_sim/.zshrc" '{tool_name:"Edit", tool_input:{file_path:$p}}')
-run_case "#1089 fail-closed: same target ALLOWED with an active ticket, lib still missing" 0 "" "$in" "$sb"
+run_case "#1089 fail-closed: out-of-tree target stays blocked even with an active ticket" 2 "BLOCKED" "$in" "$sb2"
 rm -rf "$home_sim"
 
 # 78. Bash write to a plainly in-repo path, no ticket, LIB MISSING →
@@ -975,17 +1221,15 @@ run_case "#1089 fail-closed: in-repo write still BLOCKED when lib missing" 2 "BL
 
 # --- #1396: honor the active ticket for an unextractable Bash target ---
 #
-# active_ticket_marker_for_path used to return an empty marker as soon as
-# the target path could not be resolved (`[ -n "$resolved" ] || return 0`),
-# BEFORE it ever looked at current-ticket. The gate then blocked the write
-# even though a ticket was active. The fix: skip only the per-worktree and
-# per-project tiers when the target is unknown (there is no project to
-# resolve), and still check the ops-level current-ticket fallback.
+# A target the detector cannot extract has no path to resolve, so the gate
+# judges it against the working directory of the hook. The marker in that
+# tree's git dir must therefore still allow the write, and a marker kept for
+# another tree must not.
 
 # 79. python3 -c with a COMPUTED path (no literal string) → unextractable
-#     target, but a current-ticket marker IS active → allowed (#1396 repro).
+#     target, but a ticket marker IS active in the working tree → allowed (#1396 repro).
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=1396
 title=test
@@ -1002,30 +1246,23 @@ in=$(jq -nc --arg c 'python3 -c "import pathlib; p = compute_path(); pathlib.Pat
   '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#1396 unextractable target still blocked w/o any ticket" 2 "BLOCKED" "$in" "$sb"
 
-# 81. Same command, a per-project marker exists for a DIFFERENT project but
-#     no current-ticket fallback → still BLOCKED (the per-project/per-
-#     worktree tiers are correctly skipped for an unknown target — they
-#     require a resolved project, which an unextractable target never has —
-#     and skipping them must not accidentally fall back to granting one of
-#     their markers).
+# 81. Same command, a marker exists in a registered project clone but the
+#     working directory is the ops fork, which has none → still BLOCKED. The
+#     marker of another tree must not answer for this tree.
 sb=$(make_sandbox)
-mkdir -p "$sb/.claude/session/tickets"
-cat > "$sb/.claude/session/tickets/myproj" <<EOF
-repo=me2resh/apexyard
-number=513
-title=unrelated project ticket
-EOF
+add_project "$sb" myproj
+write_marker "$sb/workspace/myproj" 513
 in=$(jq -nc --arg c 'python3 -c "import pathlib; p = compute_path(); pathlib.Path(p).write_text(x)"' \
   '{tool_name:"Bash", tool_input:{command:$c}}')
-run_case "#1396 unextractable target ignores an unrelated per-project marker" 2 "BLOCKED" "$in" "$sb"
+run_case "#1396 unextractable target ignores a marker kept for a project clone" 2 "BLOCKED" "$in" "$sb"
 
 # 82. The #1396 issue's own reported repro: an in-place `sed -i` edit on a
 #     path held in a shell variable, not the python3 shape cases 79-81 use.
 #     bash_extract_write_targets does not extract a sed -i target at all, so
-#     this is the same unextractable-target class — a current-ticket marker
-#     IS active → allowed.
+#     this is the same unextractable-target class, and a ticket marker IS
+#     active in the working tree → allowed.
 sb=$(make_sandbox)
-cat > "$sb/.claude/session/current-ticket" <<EOF
+cat > "$sb/.git/apexyard-ticket" <<EOF
 repo=me2resh/apexyard
 number=1396
 title=test
@@ -1034,6 +1271,37 @@ EOF
 in=$(jq -nc --arg c 'sed -i "s/x/y/" "$VAR"' \
   '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#1396 reported repro: sed -i on a variable path honors active ticket" 0 "" "$in" "$sb"
+
+# --- #1480: git log/diff --output, sort -o, yq -i, python3 -Bc -------------
+#
+# Each form exited 0 with no ticket on dev. The detector must block without
+# a ticket and allow with one. Ordinary neighbours stay ungated.
+
+for c in 'git log --output=src/app.ts' 'git log --output src/app.ts' \
+         'git diff --output=src/app.ts' 'git diff --output src/app.ts' \
+         'sort -o src/app.ts input.txt' 'yq -i ".a=1" src/app.ts' \
+         "python3 -Bc \"open('src/app.ts','w').write('x')\"" \
+         "python3 -W ignore -c \"open('src/app.ts','w').write('x')\""; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1480 blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+
+  sb=$(make_sandbox)
+  cat > "$sb/.git/apexyard-ticket" <<EOF
+repo=me2resh/apexyard
+number=1480
+title=write detector gaps
+EOF
+  run_case "#1480 allowed WITH ticket: $c" 0 "" "$in" "$sb"
+done
+
+# This fixture omits _lib-command-scrub.sh, so a quoted '>' still reads as a
+# redirect here. test_command_scrub_regressions.sh covers the quoted case.
+for c in "git log --oneline -1" "sort src/app.ts" 'yq ".a" src/app.ts'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1480 sanity: read stays ungated: $c" 0 "" "$in" "$sb"
+done
 
 # --- Summary -----------------------------------------------------------
 

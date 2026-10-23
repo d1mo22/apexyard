@@ -16,6 +16,7 @@ Reusable GitHub Actions workflows that integrate ApexYard's automated agents int
 | `review-check.yml` | Rex (verification) | Block merge if Rex hasn't reviewed the latest commit | Every PR + review event |
 | `seo-check.yml` | SEO Check | SEO analysis for content files | Content changes |
 | `auto-tag-on-release-pr-merge.yml` | CI | Auto-tag squash commit + create GitHub Release when a `release/v*` PR merges | PR closed (merged) |
+| `refresh-ready-prs.yml` | Rex | Refresh the oldest eligible behind PR and remove stale readiness labels | Integration push, PR synchronize |
 | `ci.yml` | Combined | All checks in one pipeline | Every PR |
 
 ---
@@ -95,20 +96,51 @@ cp ~/apexyard/golden-paths/pipelines/ci.yml .github/workflows/
 
 **Agent**: Guardian (Dependency Auditor)
 
+**Ecosystems** (AgDR-0176 / issue #1359): npm and Python via a finite runner map. Other ecosystems stay out of scope for this first pass. Helper revision 4 lists known unsupported manifests in `not_scanned`. The helper exits 3 for those files only when no npm or Python dependency set is selected for checks and no `--ecosystem` filter is set. A Critical finding still exits 1. Every other case keeps the normal exit code.
+
 **Checks performed**:
 
-- npm audit (vulnerabilities by severity)
-- npm outdated (major / minor / patch versions behind)
-- license-checker (GPL, LGPL, unknown licenses)
+- Shared helper: `scripts/dependency-audit.py` (copy to `.github/scripts/dependency-audit.py`)
+- npm: `npm audit`, outdated checks, licence metadata from an `--ignore-scripts` install
+- Python: data-only inventory from locks / exact pins. Prefer `pip-audit==2.10.0` (`-s osv --no-deps --disable-pip`). Fall back to OSV when the trusted scanner is absent. Licence and outdated checks use version-specific PyPI metadata.
+- Severity totals include Critical, High, Medium, Low, and Unknown
+- Unknown licence metadata is pending review (not banned). It still blocks clearance.
+
+**Copy / refresh procedure**:
+
+```bash
+mkdir -p .github/workflows .github/scripts
+cp golden-paths/pipelines/dependency-audit.yml .github/workflows/
+cp golden-paths/pipelines/scripts/dependency-audit.py .github/scripts/
+cp golden-paths/pipelines/scripts/dependency-audit-tools.requirements.txt .github/scripts/
+# Optional metadata companion (not required by the workflow install step):
+# cp golden-paths/pipelines/scripts/dependency-audit-tools.lock.json .github/scripts/
+# Compare helper_revision in the JSON report when refreshing after a framework upgrade.
+# The framework helper revision is 4.
+# dependency-audit-tools.requirements.txt is a hashed lock (#1478, AgDR-0194).
+# Regenerate it after changing a pin with the command below.
+```
+
+From the framework repository root, with network access and `uv` installed:
+
+```bash
+uv pip compile --python-version 3.12 --python-platform x86_64-unknown-linux-gnu \
+  --generate-hashes --no-header \
+  -o golden-paths/pipelines/scripts/dependency-audit-tools.requirements.txt \
+  golden-paths/pipelines/scripts/dependency-audit-tools.in
+```
 
 **Automated actions**:
 
-- Creates a GitHub issue for critical / high vulnerabilities
+- Uploads per-ecosystem evidence and a combined report
+- On the default branch, opens or updates a triage issue for Critical / High / Unknown findings
 - Weekly scheduled audit (Monday 9 AM UTC)
 
 **Fail conditions**:
 
 - Critical vulnerabilities found
+- Incomplete selected coverage (default). Set repository variable `DEPENDENCY_AUDIT_FAIL_ON_INCOMPLETE=false` to warn instead. Never treat incomplete coverage as clean.
+- Unknown severity emits a warning and a triage issue. It does not use the Critical threshold alone.
 
 ---
 
@@ -329,3 +361,31 @@ Ensure your `package.json` has these scripts:
 3. **Enable `dependency-audit.yml`** — weekly health checks
 4. **Add `review-check.yml`** — once you have agents reviewing PRs
 5. **Add `seo-check.yml` for content sites** — optimise discoverability
+
+### Refresh Ready PRs (`refresh-ready-prs.yml`)
+
+Copy this workflow into `.github/workflows/`. Create the `ready-to-merge` repository label before Rex uses it.
+Set `INTEGRATION_BRANCHES` to `main` for projects without `dev`. The default is `dev`.
+For other branches, also change the static `on.push.branches` list. GitHub does not expand environment variables in event filters.
+
+Each integration push attempts only the oldest open, non-draft, same-repository labelled PR that is behind.
+The workflow orders PRs by creation time and stops after one attempt, including a failed attempt.
+It never merges or force-pushes. Conflict comments repeat only when the head changes.
+
+Configure `APEXYARD_BOT_TOKEN` with repository contents and pull-request write access to start CI after branch updates.
+Without this secret, the workflow uses `GITHUB_TOKEN` and logs the CI limitation.
+GitHub suppresses new workflow runs for pushes made with `GITHUB_TOKEN`.
+Refresh failures produce one comment per head SHA. The orchestrator resolves conflicts.
+The workflow skips fork PRs. It does not refresh them, and it does not remove their label after a new commit, because a fork run has a read-only token.
+Treat the Rex marker SHA as the reviewed head for a fork PR. Update a fork branch only with the user's approval.
+The workflow never grants merge approval. Existing carry-over checks and per-PR human approval still apply.
+
+### Framework hook-test tiers
+
+The framework's `tests.yml` uses a light PR tier, a heavy tier, and a release tier.
+Regular PRs run the full Linux jq-1.7 suite.
+Docs-only PRs skip hook jobs and retain the required `hook test suite` summary.
+Pushes to `dev` and `main`, nightly runs on `dev`, and manual runs add the Linux jq-1.8 leg.
+Release PRs also require the reusable conformance workflow through the summary when the repository variable `CONFORMANCE_ON_RELEASE` is `true`.
+CI does not run `/bin/bash` 3.2 or macOS system awk. Run `/bin/bash bin/run-hook-tests.sh` locally before you push.
+See [AgDR-0236](../../docs/agdr/AgDR-0236-tiered-ci.md) and [AgDR-0259](../../docs/agdr/AgDR-0259-no-macos-ci-runners.md) for selection rules and risks.

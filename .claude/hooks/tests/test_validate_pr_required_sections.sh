@@ -16,6 +16,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/validate-pr-create.sh"
 # shellcheck source=_lib-mock-gh.sh
 source "$(cd "$(dirname "$0")" && pwd)/_lib-mock-gh.sh"
@@ -43,6 +48,8 @@ make_sandbox() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   local src_root
   src_root=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -59,7 +66,7 @@ run_case() {
   local sb; sb=$(make_sandbox)
   mock_gh_install "$sb"
   local body_file="$sb/body.md"
-  printf '%s' "$body_content" > "$body_file"
+  printf '## Summary\nsample change\n\n%s\n\nRefs #113\n' "$body_content" > "$body_file"
   local cmd="gh pr create --repo me2resh/apexyard --title 'chore(#113): test' --body-file $body_file"
   local input
   input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
@@ -118,10 +125,10 @@ run_case "body missing both → block also names Glossary" \
   "just a plain summary" \
   2 "missing required '## Glossary' section"
 
-run_case "skip marker bypasses with warning" \
+run_case "skip marker cannot bypass required sections" \
   "no sections here
 <!-- pr-sections: skip -->" \
-  0 "pr-sections check bypassed by skip marker"
+  2 "missing required '## Testing' section"
 
 run_case "headings are case-insensitive" \
   "## testing
